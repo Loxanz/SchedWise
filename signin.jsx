@@ -149,7 +149,7 @@ export default function Signin() {
                 activeOpacity={0.7}
                 onPress={() => router.push("/signup")}
               >
-                <Text style={styles.signupLink}>Sign up free</Text>
+                <Text style={styles.signupLink}>Sign up</Text>
               </TouchableOpacity>
             </View>
           </View>

@@ -1,20 +1,20 @@
-import React, { useState } from "react";
+import { Feather, FontAwesome, Ionicons } from "@expo/vector-icons";
+import { LinearGradient } from "expo-linear-gradient";
+import { useRouter } from "expo-router";
+import { useState } from "react";
 import {
+  Image,
+  KeyboardAvoidingView,
+  Platform,
   SafeAreaView,
-  View,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  StyleSheet,
-  StatusBar,
-  KeyboardAvoidingView,
-  Platform,
-  Image,
-  ScrollView,
+  View,
 } from "react-native";
-import { LinearGradient } from "expo-linear-gradient";
-import { Feather, FontAwesome, Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
 
 const TOP_SAFE_SPACE =
   Platform.OS === "android" ? StatusBar.currentHeight || 24 : 12;

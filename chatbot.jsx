@@ -1,45 +1,123 @@
-import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Feather } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRef, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-    KeyboardAvoidingView,
-    Platform,
-    SafeAreaView,
-    ScrollView,
-    StatusBar,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  Image,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
+  SafeAreaView,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 
 const TOP_SAFE_SPACE =
   Platform.OS === "android" ? StatusBar.currentHeight || 24 : 12;
+
+// This controls the input position when keyboard is closed
+// Change the Android number if you want to move it higher/lower
+// Bigger number = higher, smaller number = lower
+const REST_INPUT_BOTTOM_PADDING = Platform.OS === "ios" ? 100 : 30;
+
+// First opening of chatbot tab
+const DEFAULT_INPUT_BOTTOM_PADDING = Platform.OS === "ios" ? 100 : 85;
+
+// After keyboard closes
+const CLOSED_INPUT_BOTTOM_PADDING = REST_INPUT_BOTTOM_PADDING;
+
+// While keyboard is open
+const OPEN_INPUT_BOTTOM_PADDING = Platform.OS === "ios" ? 12 : 10;
+
+const botImage = require("../../assets/images/SchedWise bot.png");
 
 const quickPrompts = [
   "What is my schedule today?",
   "Help me plan my study time",
   "Remind me of my deadlines",
   "Create a review plan",
+  "Organize my assignments",
+  "Check my upcoming tasks",
+  "Make a weekly study plan",
+  "Help me prioritize tasks",
 ];
 
 export default function ChatbotScreen() {
   const scrollRef = useRef(null);
+  const keyboardWasOpenedRef = useRef(false);
+  const hasInteractedRef = useRef(false);
+
   const [message, setMessage] = useState("");
+  const [inputBottomPadding, setInputBottomPadding] = useState(
+    DEFAULT_INPUT_BOTTOM_PADDING
+  );
 
   const [messages, setMessages] = useState([
     {
       id: 1,
       sender: "ai",
-      text: "Hi! I’m your SchedWise AI Assistant. Ask me about your schedules, deadlines, study plans, or academic tasks.",
+      text: "Hi! I'm your SchedWise AI Assistant. Ask me about your schedules, deadlines, study plans, or academic tasks.",
     },
     {
       id: 2,
       sender: "ai",
-      text: "Example: “Help me organize my assignments this week.”",
+      text: 'Example: "Help me organize my assignments this week."',
     },
   ]);
+
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => {
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      keyboardWasOpenedRef.current = false;
+
+      if (!hasInteractedRef.current) {
+        setInputBottomPadding(DEFAULT_INPUT_BOTTOM_PADDING);
+      } else {
+        setInputBottomPadding(CLOSED_INPUT_BOTTOM_PADDING);
+      }
+
+      return () => {};
+    }, [])
+  );
+
+  useEffect(() => {
+    const keyboardShowEvent =
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+
+    const keyboardHideEvent =
+      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+
+    const keyboardShowListener = Keyboard.addListener(keyboardShowEvent, () => {
+      hasInteractedRef.current = true;
+      keyboardWasOpenedRef.current = true;
+      setInputBottomPadding(OPEN_INPUT_BOTTOM_PADDING);
+      scrollToBottom();
+    });
+
+    const keyboardHideListener = Keyboard.addListener(keyboardHideEvent, () => {
+      keyboardWasOpenedRef.current = false;
+      setInputBottomPadding(CLOSED_INPUT_BOTTOM_PADDING);
+
+      setTimeout(() => {
+        scrollToBottom();
+      }, 150);
+    });
+
+    return () => {
+      keyboardShowListener.remove();
+      keyboardHideListener.remove();
+    };
+  }, [scrollToBottom]);
 
   const sendMessage = (textToSend = message) => {
     const trimmedMessage = textToSend.trim();
@@ -59,6 +137,7 @@ export default function ChatbotScreen() {
 
     setMessages((prev) => [...prev, userMessage, aiReply]);
     setMessage("");
+    scrollToBottom();
   };
 
   return (
@@ -71,8 +150,8 @@ export default function ChatbotScreen() {
 
       <KeyboardAvoidingView
         style={styles.keyboardView}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 60}
+        behavior="padding"
+        keyboardVerticalOffset={0}
       >
         <LinearGradient
           colors={["#081225", "#0d2342", "#081225"]}
@@ -81,30 +160,27 @@ export default function ChatbotScreen() {
           <View style={styles.headerTop}>
             <View style={styles.headerTextArea}>
               <Text style={styles.headerLabel}>AI Chatbot</Text>
-              <Text style={styles.headerTitle}>SchedWise Assistant</Text>
+
+              <Text
+                style={styles.headerTitle}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.78}
+              >
+                SchedWise Assistant
+              </Text>
+
               <Text style={styles.headerSubtitle}>
                 Ask AI to manage your schedules, deadlines, and study plans.
               </Text>
             </View>
 
             <View style={styles.botIconWrapper}>
-              <MaterialCommunityIcons
-                name="robot-outline"
-                size={32}
-                color="#ffffff"
+              <Image
+                source={botImage}
+                style={styles.botIconImage}
+                resizeMode="contain"
               />
-            </View>
-          </View>
-
-          <View style={styles.statusCard}>
-            <View style={styles.statusIcon}>
-              <Feather name="zap" size={22} color="#ffffff" />
-            </View>
-            <View style={styles.statusContent}>
-              <Text style={styles.statusTitle}>AI Assistant is ready</Text>
-              <Text style={styles.statusText}>
-                Type a question or choose a quick prompt below.
-              </Text>
             </View>
           </View>
         </LinearGradient>
@@ -115,6 +191,7 @@ export default function ChatbotScreen() {
             style={styles.messagesArea}
             contentContainerStyle={styles.messagesContent}
             showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
             onContentSizeChange={() =>
               scrollRef.current?.scrollToEnd({ animated: true })
             }
@@ -131,10 +208,10 @@ export default function ChatbotScreen() {
               >
                 {item.sender === "ai" && (
                   <View style={styles.smallBotIcon}>
-                    <MaterialCommunityIcons
-                      name="robot-outline"
-                      size={18}
-                      color="#ffffff"
+                    <Image
+                      source={botImage}
+                      style={styles.smallBotImage}
+                      resizeMode="contain"
                     />
                   </View>
                 )}
@@ -160,11 +237,25 @@ export default function ChatbotScreen() {
                 </View>
               </View>
             ))}
+          </ScrollView>
 
+          <View
+            style={[
+              styles.inputArea,
+              {
+                paddingBottom: inputBottomPadding,
+              },
+            ]}
+          >
             <View style={styles.quickPromptSection}>
               <Text style={styles.quickPromptTitle}>Quick Prompts</Text>
 
-              <View style={styles.quickPromptGrid}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.quickPromptHorizontal}
+                keyboardShouldPersistTaps="handled"
+              >
                 {quickPrompts.map((prompt) => (
                   <TouchableOpacity
                     key={prompt}
@@ -175,11 +266,9 @@ export default function ChatbotScreen() {
                     <Text style={styles.promptChipText}>{prompt}</Text>
                   </TouchableOpacity>
                 ))}
-              </View>
+              </ScrollView>
             </View>
-          </ScrollView>
 
-          <View style={styles.inputArea}>
             <LinearGradient
               colors={["#0d2342", "#0a1830", "#101f3a"]}
               start={{ x: 0, y: 0 }}
@@ -200,6 +289,12 @@ export default function ChatbotScreen() {
                 onChangeText={setMessage}
                 returnKeyType="send"
                 onSubmitEditing={() => sendMessage()}
+                onFocus={() => {
+                  hasInteractedRef.current = true;
+                  keyboardWasOpenedRef.current = true;
+                  setInputBottomPadding(OPEN_INPUT_BOTTOM_PADDING);
+                  scrollToBottom();
+                }}
               />
 
               <TouchableOpacity style={styles.micButton} activeOpacity={0.75}>
@@ -216,7 +311,14 @@ export default function ChatbotScreen() {
                 activeOpacity={0.85}
                 onPress={() => sendMessage()}
               >
-                <Feather name="send" size={22} color="#ffffff" />
+                <View style={styles.sendIconWrapper}>
+                  <Feather
+                    name="send"
+                    size={21}
+                    color="#ffffff"
+                    style={styles.sendIcon}
+                  />
+                </View>
               </TouchableOpacity>
             </LinearGradient>
           </View>
@@ -237,9 +339,9 @@ const styles = StyleSheet.create({
   },
 
   header: {
-    paddingTop: TOP_SAFE_SPACE + 18,
+    paddingTop: TOP_SAFE_SPACE + 16,
     paddingHorizontal: 20,
-    paddingBottom: 24,
+    paddingBottom: 22,
     borderBottomLeftRadius: 28,
     borderBottomRightRadius: 28,
   },
@@ -247,12 +349,12 @@ const styles = StyleSheet.create({
   headerTop: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "flex-start",
+    alignItems: "center",
   },
 
   headerTextArea: {
     flex: 1,
-    paddingRight: 14,
+    paddingRight: 10,
   },
 
   headerLabel: {
@@ -265,65 +367,35 @@ const styles = StyleSheet.create({
 
   headerTitle: {
     color: "#ffffff",
-    fontSize: 27,
+    fontSize: 25,
     fontWeight: "900",
-    marginTop: 6,
+    marginTop: 5,
+    flexShrink: 1,
   },
 
   headerSubtitle: {
     color: "#b6c7e6",
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 8,
+    fontSize: 13.5,
+    lineHeight: 19,
+    marginTop: 7,
+    paddingRight: 4,
   },
 
   botIconWrapper: {
-    width: 58,
-    height: 58,
-    borderRadius: 20,
-    backgroundColor: "#6d5dfc",
+    width: 52,
+    height: 52,
+    borderRadius: 18,
+    backgroundColor: "#4f7df3",
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.16)",
+    overflow: "hidden",
   },
 
-  statusCard: {
-    marginTop: 22,
-    backgroundColor: "rgba(255,255,255,0.08)",
-    borderRadius: 20,
-    padding: 16,
-    flexDirection: "row",
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.12)",
-  },
-
-  statusIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 16,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 14,
-  },
-
-  statusContent: {
-    flex: 1,
-  },
-
-  statusTitle: {
-    color: "#ffffff",
-    fontSize: 15,
-    fontWeight: "900",
-  },
-
-  statusText: {
-    color: "#b6c7e6",
-    fontSize: 13,
-    lineHeight: 18,
-    marginTop: 3,
+  botIconImage: {
+    width: 40,
+    height: 40,
   },
 
   chatWrapper: {
@@ -359,10 +431,16 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 12,
-    backgroundColor: "#6d5dfc",
+    backgroundColor: "#4f7df3",
     alignItems: "center",
     justifyContent: "center",
     marginRight: 8,
+    overflow: "hidden",
+  },
+
+  smallBotImage: {
+    width: 25,
+    height: 25,
   },
 
   messageBubble: {
@@ -398,21 +476,27 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
 
+  inputArea: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    backgroundColor: "#081225",
+    borderTopWidth: 1,
+    borderTopColor: "#13203a",
+  },
+
   quickPromptSection: {
-    marginTop: 8,
+    marginBottom: 10,
   },
 
   quickPromptTitle: {
     color: "#ffffff",
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "900",
-    marginBottom: 12,
+    marginBottom: 9,
   },
 
-  quickPromptGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 10,
+  quickPromptHorizontal: {
+    paddingRight: 14,
   },
 
   promptChip: {
@@ -422,6 +506,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderWidth: 1,
     borderColor: "#1b2944",
+    marginRight: 10,
   },
 
   promptChipText: {
@@ -430,21 +515,12 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 
-  inputArea: {
-    paddingHorizontal: 14,
-    paddingTop: 12,
-    paddingBottom: Platform.OS === "ios" ? 90 : 72,
-    backgroundColor: "#081225",
-    borderTopWidth: 1,
-    borderTopColor: "#13203a",
-  },
-
   chatInputBar: {
     minHeight: 64,
     borderRadius: 32,
     flexDirection: "row",
     alignItems: "center",
-    paddingLeft: 18,
+    paddingLeft: 14,
     paddingRight: 8,
     borderWidth: 1,
     borderColor: "rgba(142, 162, 193, 0.22)",
@@ -456,8 +532,9 @@ const styles = StyleSheet.create({
   },
 
   plusButton: {
-    width: 32,
-    height: 32,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -476,14 +553,17 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     fontSize: 17,
     paddingVertical: 0,
+    includeFontPadding: false,
   },
 
   micButton: {
-    width: 38,
-    height: 38,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: "center",
     justifyContent: "center",
-    marginHorizontal: 4,
+    marginLeft: 2,
+    marginRight: 4,
   },
 
   sendButton: {
@@ -492,6 +572,22 @@ const styles = StyleSheet.create({
     borderRadius: 26,
     alignItems: "center",
     justifyContent: "center",
+    padding: 0,
+    overflow: "hidden",
+  },
+
+  sendIconWrapper: {
+    width: 52,
+    height: 52,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  sendIcon: {
+    textAlign: "center",
+    textAlignVertical: "center",
+    includeFontPadding: false,
+    transform: [{ translateX: -1 }, { translateY: 1 }],
   },
 
   sendButtonActive: {
