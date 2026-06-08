@@ -23,7 +23,7 @@ import {
 } from "react-native";
 import {
   getLocalSchedules,
-  mergeRemoteSchedulesWithLocal,
+  replaceLocalSchedules,
 } from "../lib/localSchedules";
 import { getUserSchedules, supabase } from "../lib/supabase";
 
@@ -227,21 +227,24 @@ export default function ProfileScreen() {
 
       if (!session?.user) {
         setSchedules([]);
+        await replaceLocalSchedules([]);
         return;
       }
-
-      const localSchedules = await getLocalSchedules();
-      setSchedules(localSchedules);
 
       const { data, error } = await getUserSchedules();
 
       if (error) {
         console.log("Profile task overview Supabase error:", error?.message);
+
+        const localSchedules = await getLocalSchedules();
+        setSchedules(localSchedules);
         return;
       }
 
-      const mergedSchedules = await mergeRemoteSchedulesWithLocal(data);
-      setSchedules(mergedSchedules);
+      const remoteSchedules = Array.isArray(data) ? data : [];
+
+      await replaceLocalSchedules(remoteSchedules);
+      setSchedules(remoteSchedules);
     } catch (error) {
       console.log("Profile task overview load error:", error?.message);
 
@@ -306,6 +309,7 @@ export default function ProfileScreen() {
       } else {
         setProfileImageUri(null);
         setSchedules([]);
+        await replaceLocalSchedules([]);
       }
     });
 
@@ -476,6 +480,7 @@ export default function ProfileScreen() {
           setUser(null);
           setProfileImageUri(null);
           setSchedules([]);
+          await replaceLocalSchedules([]);
 
           const { error } = await supabase.auth.signOut();
 
