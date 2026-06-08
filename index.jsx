@@ -1,10 +1,12 @@
 import { Feather } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRouter } from "expo-router";
-import { useCallback, useRef, useState } from "react";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  DeviceEventEmitter,
   Image,
   KeyboardAvoidingView,
   Modal,
@@ -19,6 +21,29 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { addScheduleToDeviceCalendar } from "../lib/deviceCalendar";
+import {
+  buildConflictNotificationBody,
+  buildConflictSummary,
+  detectScheduleConflicts,
+} from "../lib/conflictDetector";
+import { sendScheduleConflictNotification } from "../lib/conflictNotifications";
+import {
+  addLocalSchedule,
+  getLocalSchedules,
+  isLocalOnlySchedule,
+  markLocalScheduleSyncFailed,
+  markLocalScheduleSynced,
+  mergeRemoteSchedulesWithLocal,
+  updateLocalSchedule,
+} from "../lib/localSchedules";
+import {
+  addUserSchedule,
+  getCurrentUser,
+  getUserSchedules,
+  updateScheduleDeviceCalendarSync,
+  updateUserSchedule,
+} from "../lib/supabase";
 
 const TOP_SAFE_SPACE =
   Platform.OS === "android" ? StatusBar.currentHeight || 24 : 12;
@@ -39,6 +64,81 @@ const FONT_HEADER = 22;
 const FONT_MODAL_TITLE = 23;
 const FONT_WHEEL = 16;
 const FONT_WHEEL_ACTIVE = 18;
+
+const THEME_STORAGE_KEY = "schedwise_app_theme_mode";
+const SCHEDULE_CHANGE_EVENT = "schedwise_schedules_changed";
+
+const DARK_THEME = {
+  mode: "dark",
+  background: "#081225",
+  statusBarStyle: "light-content",
+  headerGradient: ["#081225", "#0d2342", "#081225"],
+  text: "#ffffff",
+  onPrimary: "#ffffff",
+  muted: "#8ea2c1",
+  softText: "#b6c7e6",
+  placeholder: "#6f819f",
+  primary: "#4f7df3",
+  primaryLight: "#65a1ff",
+  primarySoft: "#8bb8ff",
+  primaryTint: "rgba(101,161,255,0.13)",
+  primaryTintStrong: "rgba(101,161,255,0.16)",
+  primaryTintSoft: "rgba(101,161,255,0.08)",
+  primaryBorder: "rgba(101,161,255,0.25)",
+  primaryBorderStrong: "rgba(101,161,255,0.55)",
+  card: "#0d1529",
+  surface: "#121c32",
+  input: "#0d1529",
+  modal: "#081225",
+  border: "#1b2944",
+  borderSoft: "#13203a",
+  handle: "#334563",
+  overlay: "rgba(0,0,0,0.78)",
+  modalOverlay: "rgba(0,0,0,0.7)",
+  success: "#22c55e",
+  warning: "#f59e0b",
+  danger: "#ff4d5f",
+  switchOff: "#31476c",
+  shadow: "#4f7df3",
+  dashedBg: "rgba(101,161,255,0.08)",
+  dashedBorder: "rgba(101,161,255,0.26)",
+};
+
+const LIGHT_THEME = {
+  mode: "light",
+  background: "#f4f7fb",
+  statusBarStyle: "dark-content",
+  headerGradient: ["#eef5ff", "#ffffff", "#f4f7fb"],
+  text: "#10203b",
+  onPrimary: "#ffffff",
+  muted: "#60718f",
+  softText: "#4f607a",
+  placeholder: "#8a98ad",
+  primary: "#4f7df3",
+  primaryLight: "#3f76e8",
+  primarySoft: "#9fc0ff",
+  primaryTint: "rgba(79,125,243,0.12)",
+  primaryTintStrong: "rgba(79,125,243,0.16)",
+  primaryTintSoft: "rgba(79,125,243,0.07)",
+  primaryBorder: "rgba(79,125,243,0.22)",
+  primaryBorderStrong: "rgba(79,125,243,0.45)",
+  card: "#ffffff",
+  surface: "#eef4ff",
+  input: "#ffffff",
+  modal: "#ffffff",
+  border: "#d9e4f2",
+  borderSoft: "#dce6f3",
+  handle: "#b7c4d8",
+  overlay: "rgba(7,16,34,0.48)",
+  modalOverlay: "rgba(7,16,34,0.46)",
+  success: "#16a34a",
+  warning: "#d97706",
+  danger: "#ef4444",
+  switchOff: "#d7e0ec",
+  shadow: "#9ab8ff",
+  dashedBg: "rgba(79,125,243,0.06)",
+  dashedBorder: "rgba(79,125,243,0.22)",
+};
 
 const months = [
   "JAN",
@@ -289,7 +389,9 @@ export default function HomeDashboard() {
   const reminderUnitScrollRef = useRef(null);
   const reminderTimingScrollRef = useRef(null);
 
-  const [schedules, setSchedules] = useState(initialSchedules);
+  const [schedules, setSchedules] = useState([]);
+  const [loadingSchedules, setLoadingSchedules] = useState(false);
+  const [savingSchedule, setSavingSchedule] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
 
   const [datePickerVisible, setDatePickerVisible] = useState(false);
@@ -321,6 +423,64 @@ export default function HomeDashboard() {
 
   const [proofTarget, setProofTarget] = useState(null);
   const [proofImageUri, setProofImageUri] = useState("");
+
+  const [isDarkMode, setIsDarkMode] = useState(true);
+
+  const [conflictModalVisible, setConflictModalVisible] = useState(false);
+  const [detectedConflicts, setDetectedConflicts] = useState([]);
+  const [conflictSuggestions, setConflictSuggestions] = useState([]);
+  const [pendingConflictSchedule, setPendingConflictSchedule] = useState(null);
+
+  const theme = isDarkMode ? DARK_THEME : LIGHT_THEME;
+  const styles = useMemo(() => createStyles(theme), [theme]);
+
+  const loadThemeMode = useCallback(async () => {
+    try {
+      const savedTheme = await AsyncStorage.getItem(THEME_STORAGE_KEY);
+      setIsDarkMode(savedTheme !== "light");
+    } catch {
+      setIsDarkMode(true);
+    }
+  }, []);
+
+  const loadSchedules = useCallback(async () => {
+    try {
+      setLoadingSchedules(true);
+
+      const localSchedules = await getLocalSchedules();
+      setSchedules(localSchedules);
+
+      const user = await getCurrentUser();
+
+      if (!user) {
+        return;
+      }
+
+      const { data, error } = await getUserSchedules();
+
+      if (error) {
+        console.log("Supabase schedules unavailable:", error?.message);
+        return;
+      }
+
+      const mergedSchedules = await mergeRemoteSchedulesWithLocal(data);
+      setSchedules(mergedSchedules);
+    } catch (error) {
+      console.log("Schedule load error:", error?.message);
+
+      const localSchedules = await getLocalSchedules();
+      setSchedules(localSchedules);
+    } finally {
+      setLoadingSchedules(false);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadThemeMode();
+      loadSchedules();
+    }, [loadThemeMode, loadSchedules])
+  );
 
   const resetForm = () => {
     setScheduleTitle("");
@@ -740,7 +900,11 @@ export default function HomeDashboard() {
   };
 
   const getSchedulesWithAutoPriority = () => {
-    const schedulesWithTimestamp = schedules.map((item) => ({
+    const activeSchedules = schedules.filter(
+      (item) => !Boolean(item?.completed)
+    );
+
+    const schedulesWithTimestamp = activeSchedules.map((item) => ({
       ...item,
       timestamp: parseScheduleDateTime(item.date, item.timeOnly),
     }));
@@ -764,7 +928,7 @@ export default function HomeDashboard() {
           month: dateDisplay.month,
           time: `${item.date} • ${item.timeOnly}`,
           priority: isHigh ? "High" : "Normal",
-          color: isHigh ? "#ff4d5f" : "#22c55e",
+          color: isHigh ? theme.danger : theme.success,
         };
       })
       .sort((a, b) => {
@@ -774,7 +938,210 @@ export default function HomeDashboard() {
       });
   };
 
-  const handleSaveSchedule = () => {
+  const clearConflictState = () => {
+    setConflictModalVisible(false);
+    setDetectedConflicts([]);
+    setConflictSuggestions([]);
+    setPendingConflictSchedule(null);
+  };
+
+  const showScheduleConflict = (conflictResult, schedulePayload) => {
+    setDetectedConflicts(conflictResult.conflicts);
+    setConflictSuggestions(conflictResult.suggestions);
+    setPendingConflictSchedule(schedulePayload);
+
+    setModalVisible(false);
+
+    setTimeout(() => {
+      setConflictModalVisible(true);
+    }, 280);
+
+    setTimeout(() => {
+      sendScheduleConflictNotification({
+        title: "Schedule conflict detected",
+        body: buildConflictNotificationBody(
+          conflictResult.conflicts,
+          conflictResult.suggestions
+        ),
+      }).catch((error) => {
+        console.log("Conflict notification failed:", error?.message);
+      });
+    }, 450);
+  };
+
+  const handleEditConflictingSchedule = () => {
+    setConflictModalVisible(false);
+
+    setTimeout(() => {
+      setModalVisible(true);
+    }, 220);
+  };
+
+  const saveSchedulePayload = async (schedulePayload) => {
+    try {
+      setSavingSchedule(true);
+      clearConflictState();
+
+      const localSchedule = await addLocalSchedule(schedulePayload);
+
+      setSchedules((prev) => [...prev, localSchedule]);
+      DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+
+      let finalSchedule = localSchedule;
+      let syncedToSupabase = false;
+
+      try {
+        const user = await getCurrentUser();
+
+        if (user) {
+          const { data: remoteSchedule, error } = await addUserSchedule({
+            ...schedulePayload,
+            deviceCalendarEventId: localSchedule.deviceCalendarEventId || "",
+            deviceCalendarId: localSchedule.deviceCalendarId || "",
+            deviceCalendarSyncedAt: localSchedule.deviceCalendarSyncedAt || "",
+          });
+
+          if (error) {
+            throw error;
+          }
+
+          if (remoteSchedule) {
+            const syncedLocalSchedule = await markLocalScheduleSynced(
+              localSchedule.id,
+              remoteSchedule
+            );
+
+            finalSchedule = syncedLocalSchedule || remoteSchedule;
+            syncedToSupabase = true;
+
+            setSchedules((prev) =>
+              prev.map((schedule) =>
+                String(schedule.id) === String(localSchedule.id)
+                  ? finalSchedule
+                  : schedule
+              )
+            );
+            DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+          }
+        }
+      } catch (syncError) {
+        await markLocalScheduleSyncFailed(
+          localSchedule.id,
+          syncError?.message || "Saved locally, but Supabase sync failed."
+        );
+
+        finalSchedule = {
+          ...localSchedule,
+          pendingSync: true,
+          syncAction: "insert",
+          syncError:
+            syncError?.message || "Saved locally, but Supabase sync failed.",
+        };
+
+        setSchedules((prev) =>
+          prev.map((schedule) =>
+            String(schedule.id) === String(localSchedule.id)
+              ? finalSchedule
+              : schedule
+          )
+        );
+        DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+      }
+
+      try {
+        const calendarResult = await addScheduleToDeviceCalendar(finalSchedule);
+        const syncedAt = new Date().toISOString();
+
+        const calendarSyncedSchedule = {
+          ...finalSchedule,
+          deviceCalendarEventId: calendarResult.eventId || "",
+          deviceCalendarId: calendarResult.calendarId || "",
+          deviceCalendarSyncedAt: syncedAt,
+        };
+
+        const updatedLocalSchedule = await updateLocalSchedule(finalSchedule.id, {
+          deviceCalendarEventId: calendarResult.eventId || "",
+          deviceCalendarId: calendarResult.calendarId || "",
+          deviceCalendarSyncedAt: syncedAt,
+          pendingSync: !syncedToSupabase || isLocalOnlySchedule(finalSchedule),
+          syncAction:
+            !syncedToSupabase || isLocalOnlySchedule(finalSchedule)
+              ? "insert"
+              : "",
+          syncError: "",
+        });
+
+        finalSchedule = updatedLocalSchedule || calendarSyncedSchedule;
+
+        setSchedules((prev) =>
+          prev.map((schedule) =>
+            String(schedule.id) === String(finalSchedule.id)
+              ? finalSchedule
+              : schedule
+          )
+        );
+
+        if (syncedToSupabase && !isLocalOnlySchedule(finalSchedule)) {
+          const { data: syncedSchedule, error: calendarSyncError } =
+            await updateScheduleDeviceCalendarSync(finalSchedule.id, {
+              deviceCalendarEventId: calendarResult.eventId || "",
+              deviceCalendarId: calendarResult.calendarId || "",
+              deviceCalendarSyncedAt: syncedAt,
+            });
+
+          if (calendarSyncError) {
+            throw calendarSyncError;
+          }
+
+          if (syncedSchedule) {
+            await markLocalScheduleSynced(finalSchedule.id, syncedSchedule);
+
+            finalSchedule = syncedSchedule;
+
+            setSchedules((prev) =>
+              prev.map((schedule) =>
+                String(schedule.id) === String(finalSchedule.id)
+                  ? finalSchedule
+                  : schedule
+              )
+            );
+          }
+        }
+
+        DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+
+        Alert.alert(
+          "Schedule Saved",
+          syncedToSupabase
+            ? "Your schedule was saved locally, synced to Supabase, and added to your phone Calendar app."
+            : "Your schedule was saved locally and added to your phone Calendar app. It will sync to Supabase when your account/internet is ready."
+        );
+      } catch (calendarError) {
+        Alert.alert(
+          "Schedule Saved",
+          syncedToSupabase
+            ? "Your schedule was saved locally and synced to Supabase, but it was not added to your phone Calendar app."
+            : "Your schedule was saved locally. It will sync to Supabase when your account/internet is ready."
+        );
+
+        console.log("Phone calendar sync error:", calendarError?.message);
+      }
+
+      resetForm();
+      setModalVisible(false);
+    } catch (error) {
+      Alert.alert(
+        "Save Failed",
+        error?.message || "Something went wrong while saving your schedule."
+      );
+    } finally {
+      setSavingSchedule(false);
+    }
+  };
+
+  const handleSaveSchedule = async () => {
+    if (savingSchedule) return;
+
     if (!scheduleTitle.trim()) {
       Alert.alert("Missing Title", "Please enter a schedule title.");
       return;
@@ -800,8 +1167,7 @@ export default function HomeDashboard() {
       return;
     }
 
-    const newSchedule = {
-      id: Date.now(),
+    const schedulePayload = {
       date: scheduleDate.trim(),
       timeOnly: scheduleTime.trim(),
       title: scheduleTitle.trim(),
@@ -813,13 +1179,36 @@ export default function HomeDashboard() {
       reminderTime: reminderEnabled ? getSelectedReminderDisplay() : "",
     };
 
-    setSchedules((prev) => [...prev, newSchedule]);
-    resetForm();
-    setModalVisible(false);
+    const conflictResult = detectScheduleConflicts(schedulePayload, schedules);
+
+    if (conflictResult.hasConflicts) {
+      showScheduleConflict(conflictResult, schedulePayload);
+      return;
+    }
+
+    await saveSchedulePayload(schedulePayload);
+  };
+
+  const handleSaveConflictingScheduleAnyway = async () => {
+    if (!pendingConflictSchedule || savingSchedule) return;
+
+    await saveSchedulePayload(pendingConflictSchedule);
+  };
+
+  const handleUseSuggestedScheduleTime = (suggestion) => {
+    if (!suggestion) return;
+
+    setScheduleDate(suggestion.date);
+    setScheduleTime(suggestion.timeOnly);
+    clearConflictState();
+
+    setTimeout(() => {
+      setModalVisible(true);
+    }, 220);
   };
 
   const getScheduleById = (scheduleId) => {
-    return schedules.find((item) => item.id === scheduleId);
+    return schedules.find((item) => String(item.id) === String(scheduleId));
   };
 
   const handleOpenProofModal = (target) => {
@@ -874,7 +1263,7 @@ export default function HomeDashboard() {
     }
   };
 
-  const handleSubmitProof = () => {
+  const handleSubmitProof = async () => {
     if (!proofTarget) return;
 
     if (!proofImageUri) {
@@ -885,34 +1274,117 @@ export default function HomeDashboard() {
       return;
     }
 
-    setSchedules((prev) =>
-      prev.map((schedule) => {
-        if (schedule.id !== proofTarget.scheduleId) return schedule;
+    const currentSchedule = getScheduleById(proofTarget.scheduleId);
 
-        if (proofTarget.type === "task") {
-          return {
-            ...schedule,
-            completed: true,
-            proofUri: proofImageUri,
-          };
+    if (!currentSchedule) {
+      Alert.alert("Schedule Missing", "This schedule could not be found.");
+      return;
+    }
+
+    let updatedSchedule = currentSchedule;
+
+    if (proofTarget.type === "task") {
+      updatedSchedule = {
+        ...currentSchedule,
+        completed: true,
+        proofUri: proofImageUri,
+      };
+    } else {
+      updatedSchedule = {
+        ...currentSchedule,
+        subtasks: currentSchedule.subtasks.map((subtask) =>
+          String(subtask.id) === String(proofTarget.subtaskId)
+            ? {
+                ...subtask,
+                completed: true,
+                proofUri: proofImageUri,
+              }
+            : subtask
+        ),
+      };
+    }
+
+    try {
+      const locallyUpdatedSchedule = await updateLocalSchedule(
+        currentSchedule.id,
+        {
+          completed: updatedSchedule.completed,
+          proofUri: updatedSchedule.proofUri,
+          subtasks: updatedSchedule.subtasks,
+          pendingSync: true,
+          syncAction: isLocalOnlySchedule(currentSchedule)
+            ? "insert"
+            : "update",
+          syncError: "",
+        }
+      );
+
+      const localFinalSchedule = locallyUpdatedSchedule || updatedSchedule;
+
+      setSchedules((prev) =>
+        prev.map((schedule) =>
+          String(schedule.id) === String(currentSchedule.id)
+            ? localFinalSchedule
+            : schedule
+        )
+      );
+
+      DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+      closeProofModal();
+
+      try {
+        const user = await getCurrentUser();
+
+        if (!user || isLocalOnlySchedule(localFinalSchedule)) {
+          return;
         }
 
-        return {
-          ...schedule,
-          subtasks: schedule.subtasks.map((subtask) =>
-            subtask.id === proofTarget.subtaskId
-              ? {
-                  ...subtask,
-                  completed: true,
-                  proofUri: proofImageUri,
-                }
-              : subtask
-          ),
-        };
-      })
-    );
+        const { data: savedUpdatedSchedule, error } = await updateUserSchedule(
+          localFinalSchedule.id,
+          {
+            completed: localFinalSchedule.completed,
+            proofUri: localFinalSchedule.proofUri,
+            subtasks: localFinalSchedule.subtasks,
+          }
+        );
 
-    closeProofModal();
+        if (error) {
+          throw error;
+        }
+
+        const finalUpdatedSchedule =
+          savedUpdatedSchedule || {
+            ...localFinalSchedule,
+            pendingSync: false,
+            syncAction: "",
+            syncError: "",
+          };
+
+        await markLocalScheduleSynced(localFinalSchedule.id, finalUpdatedSchedule);
+
+        setSchedules((prev) =>
+          prev.map((schedule) =>
+            String(schedule.id) === String(finalUpdatedSchedule.id)
+              ? finalUpdatedSchedule
+              : schedule
+          )
+        );
+
+        DeviceEventEmitter.emit(SCHEDULE_CHANGE_EVENT);
+      } catch (syncError) {
+        await markLocalScheduleSyncFailed(
+          currentSchedule.id,
+          syncError?.message || "Proof saved locally, but Supabase sync failed."
+        );
+
+        console.log("Proof Supabase sync error:", syncError?.message);
+      }
+    } catch (error) {
+      Alert.alert(
+        "Proof Upload Failed",
+        error?.message || "Something went wrong while saving your proof."
+      );
+    }
   };
 
   const getProofTargetTitle = () => {
@@ -927,7 +1399,7 @@ export default function HomeDashboard() {
     }
 
     const subtask = schedule.subtasks.find(
-      (item) => item.id === proofTarget.subtaskId
+      (item) => String(item.id) === String(proofTarget.subtaskId)
     );
 
     return subtask?.text || "";
@@ -943,17 +1415,6 @@ export default function HomeDashboard() {
     (item) => item.date === selectedWeekDate
   );
 
-  const highPriorityCount = displayedSchedules.filter(
-    (item) => item.priority === "High"
-  ).length;
-
-  const completedCount = displayedSchedules.filter(
-    (item) => item.completed
-  ).length;
-
-  const selectedCompletedCount = selectedDaySchedules.filter(
-    (item) => item.completed
-  ).length;
 
   const selectedScheduleTitle =
     selectedWeekDate === todayKey
@@ -965,8 +1426,8 @@ export default function HomeDashboard() {
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar
-        barStyle="light-content"
-        backgroundColor="#081225"
+        barStyle={theme.statusBarStyle}
+        backgroundColor={theme.background}
         translucent={false}
       />
 
@@ -974,10 +1435,7 @@ export default function HomeDashboard() {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
-        <LinearGradient
-          colors={["#081225", "#0d2342", "#081225"]}
-          style={styles.header}
-        >
+        <LinearGradient colors={theme.headerGradient} style={styles.header}>
           <View style={styles.headerTop}>
             <View style={styles.headerTextArea}>
               <Text style={styles.greeting}>Good day</Text>
@@ -1000,30 +1458,11 @@ export default function HomeDashboard() {
               />
             </View>
           </View>
-
-          <View style={styles.overviewCard}>
-            <View style={styles.overviewIcon}>
-              <Feather name="calendar" size={28} color="#ffffff" />
-            </View>
-
-            <View style={styles.overviewContent}>
-              <Text style={styles.overviewTitle}>Today</Text>
-              <Text style={styles.overviewText}>
-                {getReadableDate(todayKey)} • {displayedSchedules.length} total
-                schedules • {highPriorityCount} high priority • {completedCount}
-                completed
-              </Text>
-            </View>
-
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{months[currentDate.getMonth()]}</Text>
-            </View>
-          </View>
         </LinearGradient>
 
         <View style={styles.weekSection}>
           <View style={styles.sectionHeader}>
-            <View>
+            <View style={styles.sectionHeaderTextArea}>
               <Text style={styles.sectionTitle}>This Week</Text>
               <Text style={styles.sectionSubtitle}>
                 {getWeekRangeText(currentWeekDays)}
@@ -1032,6 +1471,7 @@ export default function HomeDashboard() {
 
             <TouchableOpacity
               activeOpacity={0.7}
+              style={styles.viewMonthButton}
               onPress={() => router.push("/calendar")}
             >
               <Text style={styles.viewText}>View Month</Text>
@@ -1103,15 +1543,8 @@ export default function HomeDashboard() {
 
         <View style={styles.section}>
           <View style={styles.scheduleSectionHeader}>
-            <View>
+            <View style={styles.sectionHeaderTextArea}>
               <Text style={styles.sectionTitle}>{selectedScheduleTitle}</Text>
-              <Text style={styles.sectionSubtitle}>
-                {getReadableDate(selectedWeekDate)} • {selectedDaySchedules.length}
-                {selectedDaySchedules.length === 1 ? " schedule" : " schedules"}
-                {selectedDaySchedules.length > 0
-                  ? ` • ${selectedCompletedCount} completed`
-                  : ""}
-              </Text>
             </View>
           </View>
 
@@ -1120,7 +1553,9 @@ export default function HomeDashboard() {
               <View style={styles.emptyScheduleIcon}>
                 <Feather name="calendar" size={24} color="#65a1ff" />
               </View>
-              <Text style={styles.emptyScheduleTitle}>No schedule for this day</Text>
+              <Text style={styles.emptyScheduleTitle}>
+                No schedule for this day
+              </Text>
               <Text style={styles.emptyScheduleText}>
                 Tap the + button to add a task, deadline, reminder, or subtask.
               </Text>
@@ -1154,14 +1589,6 @@ export default function HomeDashboard() {
 
                     <View style={styles.scheduleTitleArea}>
                       <View style={styles.scheduleTitleRow}>
-                        <View style={styles.compactScheduleIcon}>
-                          <Feather
-                            name={item.icon || "calendar"}
-                            size={15}
-                            color="#65a1ff"
-                          />
-                        </View>
-
                         <Text
                           style={[
                             styles.scheduleTitle,
@@ -1205,7 +1632,7 @@ export default function HomeDashboard() {
                     {item.reminderEnabled ? (
                       <View style={styles.metaPill}>
                         <Feather name="bell" size={13} color="#8ea2c1" />
-                        <Text style={styles.metaPillText}>
+                        <Text style={styles.metaPillText} numberOfLines={1}>
                           {item.reminderTime}
                         </Text>
                       </View>
@@ -1215,7 +1642,11 @@ export default function HomeDashboard() {
                   {item.subtasks?.length > 0 ? (
                     <View style={styles.subtaskBox}>
                       <View style={styles.subtaskHeader}>
-                        <Feather name="check-square" size={14} color="#65a1ff" />
+                        <Feather
+                          name="check-square"
+                          size={14}
+                          color="#65a1ff"
+                        />
                         <Text style={styles.subtaskLabel}>Subtasks</Text>
                       </View>
 
@@ -1323,7 +1754,7 @@ export default function HomeDashboard() {
                 <TextInput
                   style={styles.inputField}
                   placeholder="Example: Math Quiz"
-                  placeholderTextColor="#6f819f"
+                  placeholderTextColor={theme.placeholder}
                   value={scheduleTitle}
                   onChangeText={setScheduleTitle}
                 />
@@ -1392,7 +1823,7 @@ export default function HomeDashboard() {
                 <TextInput
                   style={styles.textArea}
                   placeholder="Add subtasks, one per line..."
-                  placeholderTextColor="#6f819f"
+                  placeholderTextColor={theme.placeholder}
                   value={scheduleSubtasksText}
                   onChangeText={setScheduleSubtasksText}
                   multiline
@@ -1423,8 +1854,11 @@ export default function HomeDashboard() {
                   <Switch
                     value={reminderEnabled}
                     onValueChange={setReminderEnabled}
-                    trackColor={{ false: "#31476c", true: "#8bb8ff" }}
-                    thumbColor={reminderEnabled ? "#4f7df3" : "#8ea2c1"}
+                    trackColor={{
+                      false: theme.switchOff,
+                      true: theme.primarySoft,
+                    }}
+                    thumbColor={reminderEnabled ? theme.primary : theme.muted}
                   />
                 </View>
 
@@ -1512,6 +1946,133 @@ export default function HomeDashboard() {
             </View>
           </View>
         </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal
+        visible={conflictModalVisible}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={clearConflictState}
+      >
+        <View style={styles.conflictOverlay}>
+          <View style={styles.conflictCard}>
+            <View style={styles.conflictTopAccent} />
+
+            <View style={styles.conflictIconOuter}>
+              <View style={styles.conflictIconCircle}>
+                <Feather name="alert-triangle" size={28} color="#ffffff" />
+              </View>
+            </View>
+
+            <Text style={styles.conflictTitle}>Schedule Conflict Detected</Text>
+
+            <Text style={styles.conflictSubtitle}>
+              This schedule may overlap with another task, duplicate an existing
+              one, or use the same time entry.
+            </Text>
+
+            <View style={styles.conflictSummaryBox}>
+              <View style={styles.conflictSummaryHeader}>
+                <View style={styles.conflictSummaryIcon}>
+                  <Feather name="info" size={14} color={theme.warning} />
+                </View>
+
+                <Text style={styles.conflictSummaryTitle}>Conflict Details</Text>
+              </View>
+
+              <Text style={styles.conflictSummaryText}>
+                {buildConflictSummary(detectedConflicts)}
+              </Text>
+            </View>
+
+            {conflictSuggestions.length > 0 ? (
+              <View style={styles.suggestionBox}>
+                <View style={styles.suggestionHeaderRow}>
+                  <Text style={styles.suggestionTitle}>
+                    Rescheduling Suggestions
+                  </Text>
+
+                  <View style={styles.suggestionCountPill}>
+                    <Text style={styles.suggestionCountText}>
+                      {conflictSuggestions.length}
+                    </Text>
+                  </View>
+                </View>
+
+                {conflictSuggestions.map((suggestion) => (
+                  <TouchableOpacity
+                    key={`${suggestion.date}-${suggestion.timeOnly}`}
+                    style={styles.suggestionOption}
+                    activeOpacity={0.88}
+                    onPress={() => handleUseSuggestedScheduleTime(suggestion)}
+                  >
+                    <View style={styles.suggestionIconBox}>
+                      <Feather
+                        name="clock"
+                        size={17}
+                        color={theme.primaryLight}
+                      />
+                    </View>
+
+                    <View style={styles.suggestionTextArea}>
+                      <Text style={styles.suggestionLabel} numberOfLines={1}>
+                        {suggestion.label}
+                      </Text>
+
+                      <Text style={styles.suggestionWindow} numberOfLines={1}>
+                        Available: {suggestion.windowText}
+                      </Text>
+                    </View>
+
+                    <View style={styles.suggestionArrowBox}>
+                      <Feather
+                        name="chevron-right"
+                        size={18}
+                        color={theme.primaryLight}
+                      />
+                    </View>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ) : (
+              <View style={styles.noSuggestionBox}>
+                <Feather name="clock" size={18} color={theme.warning} />
+
+                <Text style={styles.noSuggestionText}>
+                  No available time suggestion was found for this day. Try
+                  choosing a different date or time.
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.conflictActions}>
+              <TouchableOpacity
+                style={styles.conflictCancelButton}
+                activeOpacity={0.85}
+                onPress={handleEditConflictingSchedule}
+              >
+                <Text style={styles.conflictCancelText} numberOfLines={1}>
+                  Edit Schedule
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.conflictSaveButton,
+                  savingSchedule && styles.conflictDisabledButton,
+                ]}
+                activeOpacity={0.85}
+                onPress={handleSaveConflictingScheduleAnyway}
+                disabled={savingSchedule}
+              >
+                <Text style={styles.conflictSaveText} numberOfLines={1}>
+                  {savingSchedule ? "Saving..." : "Save Anyway"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
       </Modal>
 
       <Modal
@@ -1608,7 +2169,7 @@ export default function HomeDashboard() {
                 activeOpacity={0.85}
                 onPress={goToPreviousMonth}
               >
-                <Feather name="chevron-left" size={22} color="#ffffff" />
+                <Feather name="chevron-left" size={22} color={theme.text} />
               </TouchableOpacity>
 
               <View style={styles.pickerHeaderCenter}>
@@ -1624,7 +2185,7 @@ export default function HomeDashboard() {
                 activeOpacity={0.85}
                 onPress={goToNextMonth}
               >
-                <Feather name="chevron-right" size={22} color="#ffffff" />
+                <Feather name="chevron-right" size={22} color={theme.text} />
               </TouchableOpacity>
             </View>
 
@@ -2111,1421 +2672,1739 @@ export default function HomeDashboard() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#081225",
-  },
-
-  scrollContent: {
-    paddingBottom: 145,
-  },
-
-  header: {
-    paddingTop: TOP_SAFE_SPACE + 10,
-    paddingHorizontal: 20,
-    paddingBottom: 22,
-    borderBottomLeftRadius: 30,
-    borderBottomRightRadius: 30,
-  },
-
-  headerTop: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-
-  headerTextArea: {
-    flex: 1,
-    paddingRight: 10,
-  },
-
-  greeting: {
-    color: "#8ea2c1",
-    fontSize: FONT_BODY,
-    fontWeight: "600",
-  },
-
-  username: {
-    color: "#ffffff",
-    fontSize: FONT_HEADER,
-    fontWeight: "900",
-    marginTop: 5,
-    flexShrink: 1,
-  },
-
-  logoCircle: {
-    width: 62,
-    height: 62,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "transparent",
-    borderWidth: 0,
-    transform: [{ translateX: -2 }],
-  },
-
-  logoImage: {
-    width: 60,
-    height: 60,
-  },
-
-  overviewCard: {
-    marginTop: 22,
-    backgroundColor: "rgba(101,161,255,0.13)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.25)",
-    borderRadius: 24,
-    padding: 18,
-    flexDirection: "row",
-    alignItems: "center",
-  },
-
-  overviewIcon: {
-    width: 56,
-    height: 56,
-    borderRadius: 18,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 14,
-  },
-
-  overviewContent: {
-    flex: 1,
-  },
-
-  overviewTitle: {
-    color: "#ffffff",
-    fontSize: FONT_TITLE,
-    fontWeight: "900",
-  },
-
-  overviewText: {
-    color: "#91a5c6",
-    fontSize: FONT_LABEL,
-    marginTop: 5,
-    lineHeight: 18,
-  },
-
-  badge: {
-    backgroundColor: "rgba(255,255,255,0.1)",
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderRadius: 13,
-  },
-
-  badgeText: {
-    color: "#ffffff",
-    fontSize: FONT_SMALL,
-    fontWeight: "800",
-  },
-
-  weekSection: {
-    paddingHorizontal: 20,
-    marginTop: 20,
-  },
-
-  section: {
-    paddingHorizontal: 20,
-    marginTop: 24,
-  },
-
-  sectionHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-  },
-
-  sectionTitle: {
-    color: "#ffffff",
-    fontSize: FONT_TITLE,
-    fontWeight: "900",
-  },
-
-  sectionSubtitle: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    fontWeight: "700",
-    marginTop: 4,
-  },
-
-  viewText: {
-    color: "#65a1ff",
-    fontSize: FONT_LABEL,
-    fontWeight: "800",
-  },
-
-  daysRow: {
-    paddingRight: 20,
-    paddingTop: 16,
-  },
-
-  dayCard: {
-    width: 66,
-    minHeight: 102,
-    borderRadius: 22,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 12,
-    paddingVertical: 10,
-  },
-
-  activeDayCard: {
-    backgroundColor: "#4f7df3",
-    borderColor: "#8bb8ff",
-    shadowColor: "#4f7df3",
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 7,
-  },
-
-  todayDayCard: {
-    borderColor: "rgba(101,161,255,0.55)",
-    backgroundColor: "rgba(101,161,255,0.1)",
-  },
-
-  dayText: {
-    color: "#8ea2c1",
-    fontSize: FONT_LABEL,
-    fontWeight: "800",
-  },
-
-  activeDayText: {
-    color: "#ffffff",
-  },
-
-  dateText: {
-    color: "#ffffff",
-    fontSize: 23,
-    fontWeight: "900",
-    marginTop: 7,
-  },
-
-  activeDateText: {
-    color: "#ffffff",
-  },
-
-  monthText: {
-    color: "#6f819f",
-    fontSize: FONT_TINY,
-    fontWeight: "900",
-    marginTop: 2,
-  },
-
-  activeMonthText: {
-    color: "rgba(255,255,255,0.86)",
-  },
-
-  dayDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: "#65a1ff",
-    marginTop: 7,
-  },
-
-  activeDayDot: {
-    backgroundColor: "#ffffff",
-  },
-
-  scheduleSectionHeader: {
-    marginBottom: 14,
-  },
-
-  scheduleCard: {
-    backgroundColor: "#0d1529",
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    padding: 15,
-    flexDirection: "row",
-    marginBottom: 13,
-    overflow: "hidden",
-  },
-
-  timeLine: {
-    width: 5,
-    borderRadius: 10,
-    marginRight: 14,
-  },
-
-  scheduleIconBox: {
-    width: 48,
-    height: 48,
-    borderRadius: 16,
-    backgroundColor: "#121c32",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 13,
-  },
-
-  scheduleContent: {
-    flex: 1,
-  },
-
-  scheduleTop: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-  },
-
-  taskCheckbox: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-    borderWidth: 2,
-    borderColor: "#6f819f",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 10,
-    marginTop: 1,
-  },
-
-  taskCheckboxCompleted: {
-    backgroundColor: "#22c55e",
-    borderColor: "#22c55e",
-  },
-
-  scheduleTitleArea: {
-    flex: 1,
-    paddingRight: 8,
-  },
-
-  scheduleTitleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-
-  compactScheduleIcon: {
-    width: 27,
-    height: 27,
-    borderRadius: 10,
-    backgroundColor: "rgba(101,161,255,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.22)",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 8,
-  },
-
-  scheduleTitle: {
-    color: "#ffffff",
-    fontSize: FONT_MEDIUM,
-    fontWeight: "900",
-  },
-
-  completedScheduleTitle: {
-    color: "#8ea2c1",
-    textDecorationLine: "line-through",
-  },
-
-  proofRequiredText: {
-    color: "#f59e0b",
-    fontSize: FONT_SMALL,
-    fontWeight: "700",
-    marginTop: 4,
-  },
-
-  proofSubmittedText: {
-    color: "#22c55e",
-    fontSize: FONT_SMALL,
-    fontWeight: "800",
-    marginTop: 4,
-  },
-
-  priorityBadge: {
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderRadius: 11,
-  },
-
-  priorityText: {
-    fontSize: FONT_TINY,
-    fontWeight: "900",
-  },
-
-  infoRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: 8,
-  },
-
-  infoText: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    marginLeft: 7,
-    flexShrink: 1,
-  },
-
-  scheduleMetaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "wrap",
-    marginTop: 11,
-  },
-
-  metaPill: {
-    minHeight: 32,
-    borderRadius: 13,
-    backgroundColor: "#121c32",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 10,
-    marginRight: 8,
-    marginBottom: 8,
-  },
-
-  metaPillText: {
-    color: "#b6c7e6",
-    fontSize: FONT_SMALL,
-    fontWeight: "800",
-    marginLeft: 6,
-    maxWidth: 150,
-  },
-
-  emptyScheduleCard: {
-    backgroundColor: "rgba(101,161,255,0.08)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.2)",
-    borderRadius: 24,
-    padding: 22,
-    alignItems: "center",
-  },
-
-  emptyScheduleIcon: {
-    width: 52,
-    height: 52,
-    borderRadius: 18,
-    backgroundColor: "rgba(101,161,255,0.12)",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 12,
-  },
-
-  emptyScheduleTitle: {
-    color: "#ffffff",
-    fontSize: FONT_MEDIUM,
-    fontWeight: "900",
-    textAlign: "center",
-  },
-
-  emptyScheduleText: {
-    color: "#8ea2c1",
-    fontSize: FONT_LABEL,
-    lineHeight: 19,
-    textAlign: "center",
-    marginTop: 6,
-  },
-
-  subtaskBox: {
-    backgroundColor: "rgba(101,161,255,0.08)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.18)",
-    borderRadius: 14,
-    padding: 10,
-    marginTop: 12,
-  },
-
-  subtaskHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 8,
-  },
-
-  subtaskLabel: {
-    color: "#65a1ff",
-    fontSize: FONT_SMALL,
-    fontWeight: "900",
-    marginLeft: 6,
-  },
-
-  subtaskRow: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    paddingVertical: 6,
-  },
-
-  subtaskCheckbox: {
-    width: 23,
-    height: 23,
-    borderRadius: 7,
-    borderWidth: 2,
-    borderColor: "#6f819f",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 9,
-    marginTop: 1,
-  },
-
-  subtaskCheckboxCompleted: {
-    backgroundColor: "#22c55e",
-    borderColor: "#22c55e",
-  },
-
-  subtaskTextArea: {
-    flex: 1,
-  },
-
-  subtaskText: {
-    color: "#b6c7e6",
-    fontSize: FONT_SMALL,
-    lineHeight: 17,
-    fontWeight: "700",
-  },
-
-  completedSubtaskText: {
-    color: "#8ea2c1",
-    textDecorationLine: "line-through",
-  },
-
-  subtaskProofText: {
-    color: "#22c55e",
-    fontSize: FONT_TINY,
-    fontWeight: "800",
-    marginTop: 3,
-  },
-
-  bottomSpace: {
-    height: 10,
-  },
-
-  floatingAddButton: {
-    position: "absolute",
-    right: 22,
-    bottom: Platform.OS === "ios" ? 105 : 92,
-    width: 62,
-    height: 62,
-    borderRadius: 31,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    shadowColor: "#4f7df3",
-    shadowOpacity: 0.35,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 7 },
-    elevation: 12,
-    zIndex: 50,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.18)",
-  },
-
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.7)",
-    justifyContent: "flex-end",
-  },
-
-  modalCard: {
-    maxHeight: "92%",
-    backgroundColor: "#081225",
-    borderTopLeftRadius: 32,
-    borderTopRightRadius: 32,
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    paddingBottom: Platform.OS === "ios" ? 30 : 22,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-  },
-
-  dragHandle: {
-    width: 44,
-    height: 5,
-    borderRadius: 100,
-    backgroundColor: "#334563",
-    alignSelf: "center",
-    marginBottom: 18,
-  },
-
-  modalHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 20,
-  },
-
-  modalIconBox: {
-    width: 50,
-    height: 50,
-    borderRadius: 17,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 12,
-  },
-
-  modalHeaderText: {
-    flex: 1,
-  },
-
-  modalTitle: {
-    color: "#ffffff",
-    fontSize: FONT_MODAL_TITLE,
-    fontWeight: "900",
-  },
-
-  modalSubtitle: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    marginTop: 5,
-    lineHeight: 17,
-  },
-
-  formContent: {
-    paddingBottom: 18,
-  },
-
-  inputLabel: {
-    color: "#ffffff",
-    fontSize: FONT_LABEL,
-    fontWeight: "800",
-    marginBottom: 8,
-  },
-
-  inputWrapper: {
-    height: 54,
-    borderRadius: 18,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    paddingHorizontal: 14,
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 15,
-  },
-
-  inputField: {
-    flex: 1,
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    marginLeft: 10,
-    paddingVertical: 0,
-  },
-
-  pickerInput: {
-    height: 54,
-    borderRadius: 18,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    paddingHorizontal: 14,
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 15,
-  },
-
-  pickerInputText: {
-    flex: 1,
-    color: "#ffffff",
-    fontSize: FONT_LABEL,
-    fontWeight: "800",
-    marginLeft: 10,
-  },
-
-  pickerPlaceholder: {
-    flex: 1,
-    color: "#6f819f",
-    fontSize: FONT_LABEL,
-    fontWeight: "700",
-    marginLeft: 10,
-  },
-
-  dateTimeRow: {
-    flexDirection: "row",
-  },
-
-  dateTimeItem: {
-    flex: 1,
-  },
-
-  dateTimeSpacer: {
-    width: 12,
-  },
-
-  textAreaWrapper: {
-    minHeight: 115,
-    borderRadius: 18,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    flexDirection: "row",
-    alignItems: "flex-start",
-    paddingHorizontal: 14,
-    paddingTop: 14,
-    marginBottom: 10,
-  },
-
-  textAreaIcon: {
-    marginTop: 2,
-  },
-
-  textArea: {
-    flex: 1,
-    minHeight: 90,
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    marginLeft: 10,
-    paddingTop: 0,
-    paddingBottom: 0,
-  },
-
-  subtaskHintBox: {
-    backgroundColor: "rgba(101,161,255,0.1)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.22)",
-    borderRadius: 15,
-    padding: 12,
-    flexDirection: "row",
-    alignItems: "flex-start",
-    marginBottom: 16,
-  },
-
-  subtaskHintText: {
-    flex: 1,
-    color: "#91a5c6",
-    fontSize: FONT_SMALL,
-    lineHeight: 17,
-    fontWeight: "700",
-    marginLeft: 8,
-  },
-
-  reminderCard: {
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    borderRadius: 22,
-    padding: 16,
-    marginBottom: 16,
-  },
-
-  reminderHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-
-  reminderHeaderText: {
-    flex: 1,
-    paddingRight: 12,
-  },
-
-  reminderTitle: {
-    color: "#ffffff",
-    fontSize: FONT_TITLE,
-    fontWeight: "900",
-  },
-
-  reminderSubtitle: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    marginTop: 4,
-  },
-
-  reminderOptions: {
-    marginTop: 18,
-  },
-
-  reminderAtText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "800",
-    marginBottom: 10,
-  },
-
-  reminderOptionRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: 11,
-  },
-
-  reminderCheckbox: {
-    width: 28,
-    height: 28,
-    borderRadius: 6,
-    borderWidth: 2,
-    borderColor: "#6f819f",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 13,
-  },
-
-  reminderCheckboxActive: {
-    backgroundColor: "#4f7df3",
-    borderColor: "#4f7df3",
-  },
-
-  reminderOptionTextArea: {
-    flex: 1,
-  },
-
-  reminderOptionText: {
-    color: "#8ea2c1",
-    fontSize: FONT_BODY,
-    fontWeight: "700",
-  },
-
-  reminderOptionTextActive: {
-    color: "#ffffff",
-    fontWeight: "900",
-  },
-
-  customReminderSmallText: {
-    color: "#65a1ff",
-    fontSize: FONT_SMALL,
-    fontWeight: "800",
-    marginTop: 3,
-  },
-
-  autoPriorityNote: {
-    backgroundColor: "rgba(101,161,255,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.24)",
-    borderRadius: 18,
-    padding: 14,
-    flexDirection: "row",
-    alignItems: "center",
-  },
-
-  noteIconCircle: {
-    width: 36,
-    height: 36,
-    borderRadius: 13,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 12,
-  },
-
-  noteTextArea: {
-    flex: 1,
-  },
-
-  noteTitle: {
-    color: "#ffffff",
-    fontSize: FONT_LABEL,
-    fontWeight: "900",
-    marginBottom: 3,
-  },
-
-  autoPriorityText: {
-    color: "#91a5c6",
-    fontSize: FONT_SMALL,
-    lineHeight: 17,
-  },
-
-  modalActions: {
-    flexDirection: "row",
-    paddingTop: 14,
-    borderTopWidth: 1,
-    borderTopColor: "#13203a",
-  },
-
-  cancelButton: {
-    flex: 1,
-    height: 54,
-    borderRadius: 18,
-    backgroundColor: "#121c32",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 10,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-  },
-
-  cancelButtonText: {
-    color: "#b6c7e6",
-    fontSize: FONT_MEDIUM,
-    fontWeight: "900",
-  },
-
-  saveButton: {
-    flex: 1,
-    height: 54,
-    borderRadius: 18,
-    backgroundColor: "#4f7df3",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: 10,
-  },
-
-  saveButtonText: {
-    color: "#ffffff",
-    fontSize: FONT_MEDIUM,
-    fontWeight: "900",
-    marginLeft: 7,
-  },
-
-  proofOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.78)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 20,
-  },
-
-  proofCard: {
-    width: "100%",
-    backgroundColor: "#081225",
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    padding: 20,
-    alignItems: "center",
-  },
-
-  proofIconCircle: {
-    width: 58,
-    height: 58,
-    borderRadius: 20,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 14,
-  },
-
-  proofTitle: {
-    color: "#ffffff",
-    fontSize: FONT_TITLE,
-    fontWeight: "900",
-    textAlign: "center",
-  },
-
-  proofSubtitle: {
-    color: "#8ea2c1",
-    fontSize: FONT_LABEL,
-    lineHeight: 19,
-    textAlign: "center",
-    marginTop: 7,
-  },
-
-  proofTargetBox: {
-    width: "100%",
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    borderRadius: 18,
-    padding: 14,
-    marginTop: 16,
-    marginBottom: 15,
-  },
-
-  proofTargetLabel: {
-    color: "#65a1ff",
-    fontSize: FONT_SMALL,
-    fontWeight: "900",
-    marginBottom: 5,
-  },
-
-  proofTargetText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "800",
-    lineHeight: 19,
-  },
-
-  proofUploadBox: {
-    width: "100%",
-    height: 150,
-    borderRadius: 20,
-    backgroundColor: "rgba(101,161,255,0.08)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.26)",
-    borderStyle: "dashed",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 12,
-  },
-
-  proofUploadText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-    marginTop: 8,
-  },
-
-  proofUploadSubtext: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    fontWeight: "700",
-    marginTop: 4,
-  },
-
-  proofPreviewImage: {
-    width: "100%",
-    height: 180,
-    borderRadius: 20,
-    marginBottom: 12,
-  },
-
-  changeProofButton: {
-    height: 40,
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    backgroundColor: "rgba(101,161,255,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.24)",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 4,
-  },
-
-  changeProofText: {
-    color: "#65a1ff",
-    fontSize: FONT_LABEL,
-    fontWeight: "900",
-    marginLeft: 7,
-  },
-
-  proofActions: {
-    flexDirection: "row",
-    width: "100%",
-    marginTop: 14,
-  },
-
-  proofCancelButton: {
-    flex: 1,
-    height: 52,
-    borderRadius: 17,
-    backgroundColor: "#121c32",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 9,
-  },
-
-  proofCancelText: {
-    color: "#b6c7e6",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-  },
-
-  proofSubmitButton: {
-    flex: 1,
-    height: 52,
-    borderRadius: 17,
-    backgroundColor: "#4f7df3",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: 9,
-  },
-
-  proofSubmitText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-    marginLeft: 7,
-  },
-
-  pickerOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.78)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 20,
-  },
-
-  datePickerCard: {
-    width: "100%",
-    backgroundColor: "#081225",
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    padding: 18,
-  },
-
-  pickerHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 18,
-  },
-
-  pickerHeaderCenter: {
-    alignItems: "center",
-    flex: 1,
-  },
-
-  monthNavButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 15,
-    backgroundColor: "#121c32",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  pickerTitle: {
-    color: "#ffffff",
-    fontSize: FONT_HEADER,
-    fontWeight: "900",
-  },
-
-  pickerSubtitle: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    marginTop: 4,
-  },
-
-  weekRow: {
-    flexDirection: "row",
-    marginBottom: 10,
-  },
-
-  weekText: {
-    flex: 1,
-    color: "#65a1ff",
-    fontSize: FONT_SMALL,
-    fontWeight: "900",
-    textAlign: "center",
-  },
-
-  dateGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-  },
-
-  dateOption: {
-    width: `${100 / 7}%`,
-    height: 44,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: 14,
-    marginBottom: 6,
-  },
-
-  selectedDateOption: {
-    backgroundColor: "#4f7df3",
-  },
-
-  dateOptionText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "800",
-  },
-
-  selectedDateOptionText: {
-    color: "#ffffff",
-    fontWeight: "900",
-  },
-
-  pickerCancelButton: {
-    height: 50,
-    borderRadius: 16,
-    backgroundColor: "#121c32",
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 14,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-  },
-
-  pickerCancelText: {
-    color: "#b6c7e6",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-  },
-
-  timePickerOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.78)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 18,
-  },
-
-  timePickerCard: {
-    width: "100%",
-    backgroundColor: "#081225",
-    borderRadius: 26,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 16,
-  },
-
-  timePickerMainTitle: {
-    color: "#ffffff",
-    fontSize: FONT_WHEEL,
-    fontWeight: "900",
-    textAlign: "center",
-    marginBottom: 8,
-  },
-
-  timeWheelFrame: {
-    height: 190,
-    justifyContent: "center",
-    marginBottom: 14,
-  },
-
-  timeWheelHighlight: {
-    position: "absolute",
-    left: 36,
-    right: 36,
-    top: 76,
-    height: 38,
-    borderRadius: 13,
-    backgroundColor: "rgba(101,161,255,0.16)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.26)",
-  },
-
-  timeWheelColumns: {
-    height: TIME_ITEM_HEIGHT * 5,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  timeWheelColumn: {
-    width: 58,
-    height: TIME_ITEM_HEIGHT * 5,
-  },
-
-  timePeriodColumn: {
-    width: 62,
-    height: TIME_ITEM_HEIGHT * 5,
-  },
-
-  timeWheelScrollContent: {
-    paddingVertical: TIME_WHEEL_PADDING,
-  },
-
-  timeColonColumn: {
-    width: 22,
-    height: TIME_ITEM_HEIGHT,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  timeWheelRow: {
-    height: TIME_ITEM_HEIGHT,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  timeWheelText: {
-    color: "#6f819f",
-    fontSize: FONT_WHEEL,
-    fontWeight: "700",
-  },
-
-  timeWheelActiveText: {
-    color: "#ffffff",
-    fontSize: FONT_HEADER,
-    fontWeight: "900",
-  },
-
-  timeColonActiveText: {
-    color: "#ffffff",
-    fontSize: FONT_HEADER,
-    fontWeight: "900",
-  },
-
-  timePeriodText: {
-    color: "#6f819f",
-    fontSize: FONT_MEDIUM,
-    fontWeight: "800",
-    textTransform: "lowercase",
-  },
-
-  timePeriodActiveText: {
-    color: "#ffffff",
-    fontSize: FONT_WHEEL_ACTIVE,
-    fontWeight: "900",
-  },
-
-  presetsLabel: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    fontWeight: "900",
-    marginBottom: 9,
-  },
-
-  presetsRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 13,
-  },
-
-  presetButton: {
-    flex: 1,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  presetButtonSpacing: {
-    marginRight: 8,
-  },
-
-  activePresetButton: {
-    borderColor: "#65a1ff",
-    backgroundColor: "rgba(101,161,255,0.16)",
-  },
-
-  presetButtonText: {
-    color: "#8ea2c1",
-    fontSize: FONT_SMALL,
-    fontWeight: "900",
-  },
-
-  activePresetButtonText: {
-    color: "#ffffff",
-  },
-
-  timeDoneButton: {
-    height: 48,
-    borderRadius: 15,
-    backgroundColor: "#4f7df3",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  timeDoneText: {
-    color: "#ffffff",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-  },
-
-  customReminderOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.78)",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 20,
-  },
-
-  customReminderCard: {
-    width: "100%",
-    backgroundColor: "#081225",
-    borderRadius: 26,
-    paddingTop: 20,
-    paddingHorizontal: 20,
-    paddingBottom: 18,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    shadowColor: "#4f7df3",
-    shadowOpacity: 0.18,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 8,
-  },
-
-  customReminderTitle: {
-    color: "#ffffff",
-    fontSize: FONT_TITLE,
-    fontWeight: "900",
-    marginBottom: 26,
-  },
-
-  customReminderWheelFrame: {
-    height: 112,
-    justifyContent: "center",
-  },
-
-  customReminderHighlight: {
-    position: "absolute",
-    left: 14,
-    right: 14,
-    top: 36,
-    height: 40,
-    borderRadius: 14,
-    backgroundColor: "rgba(101,161,255,0.16)",
-    borderWidth: 1,
-    borderColor: "rgba(101,161,255,0.28)",
-  },
-
-  customReminderColumns: {
-    height: REMINDER_ITEM_HEIGHT * 3,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  customReminderNumberColumn: {
-    width: 60,
-    height: REMINDER_ITEM_HEIGHT * 3,
-  },
-
-  customReminderUnitColumn: {
-    width: 120,
-    height: REMINDER_ITEM_HEIGHT * 3,
-  },
-
-  customReminderTimingColumn: {
-    width: 95,
-    height: REMINDER_ITEM_HEIGHT * 3,
-  },
-
-  customReminderWheelContent: {
-    paddingVertical: REMINDER_WHEEL_PADDING,
-  },
-
-  customReminderWheelRow: {
-    height: REMINDER_ITEM_HEIGHT,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  customReminderWheelText: {
-    color: "#6f819f",
-    fontSize: FONT_WHEEL,
-    fontWeight: "700",
-  },
-
-  customReminderWheelActiveText: {
-    color: "#ffffff",
-    fontSize: FONT_WHEEL_ACTIVE,
-    fontWeight: "900",
-  },
-
-  customReminderPreviewPill: {
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: "#0d1529",
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    alignItems: "center",
-    justifyContent: "center",
-    marginHorizontal: 14,
-    marginTop: 18,
-  },
-
-  customReminderPreviewText: {
-    color: "#b6c7e6",
-    fontSize: FONT_LABEL,
-    fontWeight: "800",
-  },
-
-  customReminderActions: {
-    flexDirection: "row",
-    justifyContent: "flex-end",
-    alignItems: "center",
-    marginTop: 22,
-  },
-
-  customReminderCancelText: {
-    color: "#8ea2c1",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-    marginRight: 30,
-  },
-
-  customReminderSaveText: {
-    color: "#65a1ff",
-    fontSize: FONT_BODY,
-    fontWeight: "900",
-  },
-});
+const createStyles = (theme) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.background,
+    },
+
+    scrollContent: {
+      paddingBottom: 145,
+    },
+
+    header: {
+      paddingTop: TOP_SAFE_SPACE + 10,
+      paddingHorizontal: 20,
+      paddingBottom: 22,
+      borderBottomLeftRadius: 30,
+      borderBottomRightRadius: 30,
+    },
+
+    headerTop: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "center",
+    },
+
+    headerTextArea: {
+      flex: 1,
+      paddingRight: 12,
+    },
+
+    greeting: {
+      color: theme.muted,
+      fontSize: FONT_BODY,
+      fontWeight: "600",
+      lineHeight: 20,
+    },
+
+    username: {
+      color: theme.text,
+      fontSize: FONT_HEADER,
+      fontWeight: "900",
+      marginTop: 5,
+      flexShrink: 1,
+      lineHeight: 28,
+    },
+
+    logoCircle: {
+      width: 62,
+      height: 62,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: "transparent",
+      borderWidth: 0,
+    },
+
+    logoImage: {
+      width: 60,
+      height: 60,
+    },
+
+    weekSection: {
+      paddingHorizontal: 20,
+      marginTop: 16,
+    },
+
+    section: {
+      paddingHorizontal: 20,
+      marginTop: 18,
+    },
+
+    sectionHeader: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+    },
+
+    sectionHeaderTextArea: {
+      flex: 1,
+      paddingRight: 12,
+    },
+
+    sectionTitle: {
+      color: theme.text,
+      fontSize: 20,
+      fontWeight: "900",
+      lineHeight: 25,
+    },
+
+    sectionSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      fontWeight: "700",
+      marginTop: 4,
+      lineHeight: 17,
+    },
+
+    viewMonthButton: {
+      minHeight: 30,
+      justifyContent: "center",
+      alignItems: "center",
+      paddingHorizontal: 2,
+    },
+
+    viewText: {
+      color: theme.primaryLight,
+      fontSize: FONT_LABEL,
+      fontWeight: "800",
+      lineHeight: 18,
+    },
+
+    daysRow: {
+      paddingRight: 20,
+      paddingTop: 12,
+    },
+
+    dayCard: {
+      width: 66,
+      minHeight: 96,
+      borderRadius: 22,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 12,
+      paddingVertical: 10,
+    },
+
+    activeDayCard: {
+      backgroundColor: theme.primary,
+      borderColor: theme.primarySoft,
+      shadowColor: theme.primary,
+      shadowOpacity: 0.3,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 5 },
+      elevation: 7,
+    },
+
+    todayDayCard: {
+      borderColor: theme.primaryBorderStrong,
+      backgroundColor: theme.primaryTintSoft,
+    },
+
+    dayText: {
+      color: theme.muted,
+      fontSize: FONT_LABEL,
+      fontWeight: "800",
+      lineHeight: 17,
+      textAlign: "center",
+    },
+
+    activeDayText: {
+      color: theme.onPrimary,
+    },
+
+    dateText: {
+      color: theme.text,
+      fontSize: 23,
+      fontWeight: "900",
+      marginTop: 7,
+      lineHeight: 27,
+      textAlign: "center",
+    },
+
+    activeDateText: {
+      color: theme.onPrimary,
+    },
+
+    monthText: {
+      color: theme.placeholder,
+      fontSize: FONT_TINY,
+      fontWeight: "900",
+      marginTop: 2,
+      lineHeight: 13,
+      textAlign: "center",
+    },
+
+    activeMonthText: {
+      color: theme.onPrimary,
+    },
+
+    dayDot: {
+      width: 6,
+      height: 6,
+      borderRadius: 3,
+      backgroundColor: theme.primaryLight,
+      marginTop: 7,
+    },
+
+    activeDayDot: {
+      backgroundColor: theme.text,
+    },
+
+    scheduleSectionHeader: {
+      marginBottom: 10,
+    },
+
+    scheduleCard: {
+      backgroundColor: theme.card,
+      borderRadius: 24,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 15,
+      flexDirection: "row",
+      marginBottom: 13,
+      overflow: "hidden",
+    },
+
+    timeLine: {
+      width: 5,
+      borderRadius: 10,
+      marginRight: 13,
+    },
+
+    scheduleContent: {
+      flex: 1,
+      minWidth: 0,
+    },
+
+    scheduleTop: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      width: "100%",
+    },
+
+    taskCheckbox: {
+      width: 28,
+      height: 28,
+      borderRadius: 8,
+      borderWidth: 2,
+      borderColor: theme.placeholder,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 10,
+      marginTop: 1,
+    },
+
+    taskCheckboxCompleted: {
+      backgroundColor: theme.success,
+      borderColor: theme.success,
+    },
+
+    scheduleTitleArea: {
+      flex: 1,
+      minWidth: 0,
+      paddingRight: 8,
+    },
+
+    scheduleTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      minHeight: 30,
+    },
+
+    scheduleTitle: {
+      flex: 1,
+      color: theme.text,
+      fontSize: FONT_MEDIUM,
+      fontWeight: "900",
+      lineHeight: 20,
+      flexShrink: 1,
+    },
+
+    completedScheduleTitle: {
+      color: theme.muted,
+      textDecorationLine: "line-through",
+    },
+
+    proofRequiredText: {
+      color: theme.warning,
+      fontSize: FONT_SMALL,
+      fontWeight: "700",
+      marginTop: 5,
+      lineHeight: 16,
+    },
+
+    proofSubmittedText: {
+      color: theme.success,
+      fontSize: FONT_SMALL,
+      fontWeight: "800",
+      marginTop: 5,
+      lineHeight: 16,
+    },
+
+    priorityBadge: {
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      borderRadius: 11,
+      alignSelf: "flex-start",
+      marginTop: 2,
+    },
+
+    priorityText: {
+      fontSize: FONT_TINY,
+      fontWeight: "900",
+      lineHeight: 13,
+      textAlign: "center",
+    },
+
+    scheduleMetaRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      flexWrap: "wrap",
+      marginTop: 11,
+    },
+
+    metaPill: {
+      minHeight: 32,
+      borderRadius: 13,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 10,
+      marginRight: 8,
+      marginBottom: 8,
+      maxWidth: "100%",
+    },
+
+    metaPillText: {
+      color: theme.softText,
+      fontSize: FONT_SMALL,
+      fontWeight: "800",
+      marginLeft: 6,
+      maxWidth: 150,
+      lineHeight: 16,
+    },
+
+    emptyScheduleCard: {
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      borderRadius: 24,
+      padding: 18,
+      alignItems: "center",
+    },
+
+    emptyScheduleIcon: {
+      width: 52,
+      height: 52,
+      borderRadius: 18,
+      backgroundColor: theme.primaryTint,
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 12,
+    },
+
+    emptyScheduleTitle: {
+      color: theme.text,
+      fontSize: FONT_MEDIUM,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 20,
+    },
+
+    emptyScheduleText: {
+      color: theme.muted,
+      fontSize: FONT_LABEL,
+      lineHeight: 19,
+      textAlign: "center",
+      marginTop: 6,
+      fontWeight: "600",
+    },
+
+    subtaskBox: {
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      borderRadius: 14,
+      padding: 10,
+      marginTop: 12,
+    },
+
+    subtaskHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 8,
+    },
+
+    subtaskLabel: {
+      color: theme.primaryLight,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      marginLeft: 6,
+      lineHeight: 16,
+    },
+
+    subtaskRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      paddingVertical: 7,
+    },
+
+    subtaskCheckbox: {
+      width: 23,
+      height: 23,
+      borderRadius: 7,
+      borderWidth: 2,
+      borderColor: theme.placeholder,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 9,
+    },
+
+    subtaskCheckboxCompleted: {
+      backgroundColor: theme.success,
+      borderColor: theme.success,
+    },
+
+    subtaskTextArea: {
+      flex: 1,
+      minWidth: 0,
+      justifyContent: "center",
+    },
+
+    subtaskText: {
+      color: theme.softText,
+      fontSize: FONT_SMALL,
+      lineHeight: 18,
+      fontWeight: "700",
+      flexShrink: 1,
+    },
+
+    completedSubtaskText: {
+      color: theme.muted,
+      textDecorationLine: "line-through",
+    },
+
+    subtaskProofText: {
+      color: theme.success,
+      fontSize: FONT_TINY,
+      fontWeight: "800",
+      marginTop: 3,
+      lineHeight: 13,
+    },
+
+    bottomSpace: {
+      height: 10,
+    },
+
+    floatingAddButton: {
+      position: "absolute",
+      right: 22,
+      bottom: Platform.OS === "ios" ? 105 : 92,
+      width: 62,
+      height: 62,
+      borderRadius: 31,
+      backgroundColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+      shadowColor: theme.primary,
+      shadowOpacity: 0.35,
+      shadowRadius: 14,
+      shadowOffset: { width: 0, height: 7 },
+      elevation: 12,
+      zIndex: 50,
+      borderWidth: 1,
+      borderColor: "rgba(255,255,255,0.18)",
+    },
+
+    modalOverlay: {
+      flex: 1,
+      backgroundColor: theme.modalOverlay,
+      justifyContent: "flex-end",
+    },
+
+    modalCard: {
+      maxHeight: "92%",
+      backgroundColor: theme.background,
+      borderTopLeftRadius: 32,
+      borderTopRightRadius: 32,
+      paddingHorizontal: 20,
+      paddingTop: 12,
+      paddingBottom: Platform.OS === "ios" ? 30 : 22,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+
+    dragHandle: {
+      width: 44,
+      height: 5,
+      borderRadius: 100,
+      backgroundColor: theme.handle,
+      alignSelf: "center",
+      marginBottom: 18,
+    },
+
+    modalHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 20,
+    },
+
+    modalIconBox: {
+      width: 50,
+      height: 50,
+      borderRadius: 17,
+      backgroundColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 12,
+    },
+
+    modalHeaderText: {
+      flex: 1,
+    },
+
+    modalTitle: {
+      color: theme.text,
+      fontSize: FONT_MODAL_TITLE,
+      fontWeight: "900",
+      lineHeight: 28,
+    },
+
+    modalSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      marginTop: 5,
+      lineHeight: 17,
+      fontWeight: "600",
+    },
+
+    formContent: {
+      paddingBottom: 18,
+    },
+
+    inputLabel: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      marginBottom: 8,
+      lineHeight: 19,
+    },
+
+    inputWrapper: {
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      paddingHorizontal: 14,
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 15,
+    },
+
+    inputField: {
+      flex: 1,
+      color: theme.text,
+      fontSize: FONT_BODY,
+      marginLeft: 10,
+      paddingVertical: 0,
+      height: "100%",
+      textAlignVertical: "center",
+    },
+
+    pickerInput: {
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      paddingHorizontal: 14,
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 15,
+    },
+
+    pickerInputText: {
+      flex: 1,
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      marginLeft: 10,
+      lineHeight: 19,
+    },
+
+    pickerPlaceholder: {
+      flex: 1,
+      color: theme.placeholder,
+      fontSize: FONT_BODY,
+      fontWeight: "700",
+      marginLeft: 10,
+      lineHeight: 19,
+    },
+
+    dateTimeRow: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+    },
+
+    dateTimeItem: {
+      flex: 1,
+    },
+
+    dateTimeSpacer: {
+      width: 12,
+    },
+
+    textAreaWrapper: {
+      minHeight: 115,
+      borderRadius: 18,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      flexDirection: "row",
+      alignItems: "flex-start",
+      paddingHorizontal: 14,
+      paddingTop: 14,
+      marginBottom: 10,
+    },
+
+    textAreaIcon: {
+      marginTop: 2,
+    },
+
+    textArea: {
+      flex: 1,
+      minHeight: 90,
+      color: theme.text,
+      fontSize: FONT_BODY,
+      marginLeft: 10,
+      paddingTop: 0,
+      paddingBottom: 0,
+      lineHeight: 20,
+    },
+
+    subtaskHintBox: {
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      borderRadius: 15,
+      padding: 12,
+      flexDirection: "row",
+      alignItems: "flex-start",
+      marginBottom: 16,
+    },
+
+    subtaskHintText: {
+      flex: 1,
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      lineHeight: 17,
+      fontWeight: "700",
+      marginLeft: 8,
+    },
+
+    reminderCard: {
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: 22,
+      padding: 16,
+      marginBottom: 16,
+    },
+
+    reminderHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+    },
+
+    reminderHeaderText: {
+      flex: 1,
+      paddingRight: 12,
+    },
+
+    reminderTitle: {
+      color: theme.text,
+      fontSize: FONT_TITLE,
+      fontWeight: "900",
+      lineHeight: 23,
+    },
+
+    reminderSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      marginTop: 4,
+      lineHeight: 17,
+      fontWeight: "600",
+    },
+
+    reminderOptions: {
+      marginTop: 18,
+    },
+
+    reminderAtText: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      marginBottom: 10,
+      lineHeight: 19,
+    },
+
+    reminderOptionRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      minHeight: 48,
+      paddingVertical: 8,
+    },
+
+    reminderCheckbox: {
+      width: 28,
+      height: 28,
+      borderRadius: 6,
+      borderWidth: 2,
+      borderColor: theme.placeholder,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 13,
+    },
+
+    reminderCheckboxActive: {
+      backgroundColor: theme.primary,
+      borderColor: theme.primary,
+    },
+
+    reminderOptionTextArea: {
+      flex: 1,
+      minWidth: 0,
+      justifyContent: "center",
+    },
+
+    reminderOptionText: {
+      color: theme.muted,
+      fontSize: FONT_BODY,
+      fontWeight: "700",
+      lineHeight: 19,
+    },
+
+    reminderOptionTextActive: {
+      color: theme.text,
+      fontWeight: "900",
+    },
+
+    customReminderSmallText: {
+      color: theme.primaryLight,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      marginTop: 3,
+      lineHeight: 19,
+    },
+
+    autoPriorityNote: {
+      backgroundColor: theme.primaryTint,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      borderRadius: 18,
+      padding: 14,
+      flexDirection: "row",
+      alignItems: "center",
+    },
+
+    noteIconCircle: {
+      width: 36,
+      height: 36,
+      borderRadius: 13,
+      backgroundColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 12,
+    },
+
+    noteTextArea: {
+      flex: 1,
+    },
+
+    noteTitle: {
+      color: theme.text,
+      fontSize: FONT_LABEL,
+      fontWeight: "900",
+      marginBottom: 3,
+      lineHeight: 18,
+    },
+
+    autoPriorityText: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      lineHeight: 17,
+      fontWeight: "600",
+    },
+
+    modalActions: {
+      flexDirection: "row",
+      paddingTop: 14,
+      borderTopWidth: 1,
+      borderTopColor: theme.borderSoft,
+    },
+
+    cancelButton: {
+      flex: 1,
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.surface,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 10,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+
+    cancelButtonText: {
+      color: theme.softText,
+      fontSize: FONT_MEDIUM,
+      fontWeight: "900",
+      lineHeight: 20,
+    },
+
+    saveButton: {
+      flex: 1,
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.primary,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      marginLeft: 10,
+    },
+
+    saveButtonText: {
+      color: theme.onPrimary,
+      fontSize: FONT_MEDIUM,
+      fontWeight: "900",
+      marginLeft: 7,
+      lineHeight: 20,
+    },
+
+    conflictOverlay: {
+      flex: 1,
+      backgroundColor: theme.overlay,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 20,
+    },
+
+    conflictCard: {
+      width: "100%",
+      maxHeight: "90%",
+      backgroundColor: theme.background,
+      borderRadius: 30,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      paddingHorizontal: 18,
+      paddingTop: 22,
+      paddingBottom: 18,
+      alignItems: "center",
+      overflow: "hidden",
+      shadowColor: theme.shadow,
+      shadowOpacity: 0.24,
+      shadowRadius: 18,
+      shadowOffset: { width: 0, height: 8 },
+      elevation: 12,
+    },
+
+    conflictTopAccent: {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      right: 0,
+      height: 5,
+      backgroundColor: theme.warning,
+    },
+
+    conflictIconOuter: {
+      width: 76,
+      height: 76,
+      borderRadius: 26,
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 13,
+    },
+
+    conflictIconCircle: {
+      width: 58,
+      height: 58,
+      borderRadius: 20,
+      backgroundColor: theme.warning,
+      alignItems: "center",
+      justifyContent: "center",
+      shadowColor: theme.warning,
+      shadowOpacity: 0.35,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 5 },
+      elevation: 7,
+    },
+
+    conflictTitle: {
+      color: theme.text,
+      fontSize: 20,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 25,
+    },
+
+    conflictSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_LABEL,
+      lineHeight: 20,
+      textAlign: "center",
+      marginTop: 7,
+      fontWeight: "700",
+      paddingHorizontal: 4,
+    },
+
+    conflictSummaryBox: {
+      width: "100%",
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: 20,
+      padding: 14,
+      marginTop: 17,
+    },
+
+    conflictSummaryHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 8,
+    },
+
+    conflictSummaryIcon: {
+      width: 24,
+      height: 24,
+      borderRadius: 9,
+      backgroundColor: `${theme.warning}22`,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 8,
+    },
+
+    conflictSummaryTitle: {
+      color: theme.warning,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      lineHeight: 16,
+    },
+
+    conflictSummaryText: {
+      color: theme.text,
+      fontSize: FONT_LABEL,
+      fontWeight: "700",
+      lineHeight: 20,
+    },
+
+    suggestionBox: {
+      width: "100%",
+      marginTop: 15,
+    },
+
+    suggestionHeaderRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 10,
+    },
+
+    suggestionTitle: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+    },
+
+    suggestionCountPill: {
+      minWidth: 26,
+      height: 26,
+      borderRadius: 13,
+      backgroundColor: theme.primaryTint,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 8,
+    },
+
+    suggestionCountText: {
+      color: theme.primaryLight,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 16,
+    },
+
+    suggestionOption: {
+      minHeight: 66,
+      borderRadius: 19,
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 9,
+    },
+
+    suggestionIconBox: {
+      width: 40,
+      height: 40,
+      borderRadius: 14,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 11,
+    },
+
+    suggestionTextArea: {
+      flex: 1,
+      minWidth: 0,
+      paddingRight: 8,
+    },
+
+    suggestionLabel: {
+      color: theme.text,
+      fontSize: FONT_LABEL,
+      fontWeight: "900",
+      lineHeight: 18,
+    },
+
+    suggestionWindow: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      fontWeight: "700",
+      lineHeight: 17,
+      marginTop: 4,
+    },
+
+    suggestionArrowBox: {
+      width: 30,
+      height: 30,
+      borderRadius: 11,
+      backgroundColor: theme.primaryTint,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    noSuggestionBox: {
+      width: "100%",
+      backgroundColor: theme.primaryTintSoft,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      borderRadius: 18,
+      padding: 14,
+      marginTop: 15,
+      flexDirection: "row",
+      alignItems: "flex-start",
+    },
+
+    noSuggestionText: {
+      flex: 1,
+      color: theme.muted,
+      fontSize: FONT_LABEL,
+      fontWeight: "700",
+      lineHeight: 19,
+      marginLeft: 9,
+    },
+
+    conflictActions: {
+      flexDirection: "row",
+      width: "100%",
+      marginTop: 17,
+    },
+
+    conflictCancelButton: {
+      flex: 1,
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 8,
+      paddingHorizontal: 0,
+    },
+
+    conflictCancelText: {
+      width: "100%",
+      color: theme.softText,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+      textAlign: "center",
+      includeFontPadding: false,
+      textAlignVertical: "center",
+    },
+
+    conflictSaveButton: {
+      flex: 1,
+      height: 54,
+      borderRadius: 18,
+      backgroundColor: theme.warning,
+      alignItems: "center",
+      justifyContent: "center",
+      marginLeft: 8,
+      paddingHorizontal: 0,
+      flexDirection: "column",
+      shadowColor: theme.warning,
+      shadowOpacity: 0.25,
+      shadowRadius: 9,
+      shadowOffset: { width: 0, height: 5 },
+      elevation: 6,
+    },
+
+    conflictDisabledButton: {
+      opacity: 0.65,
+    },
+
+    conflictSaveText: {
+      width: "100%",
+      color: theme.onPrimary,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+      textAlign: "center",
+      includeFontPadding: false,
+      textAlignVertical: "center",
+    },
+
+    proofOverlay: {
+      flex: 1,
+      backgroundColor: theme.overlay,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 20,
+    },
+
+    proofCard: {
+      width: "100%",
+      backgroundColor: theme.background,
+      borderRadius: 28,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 20,
+      alignItems: "center",
+    },
+
+    proofIconCircle: {
+      width: 58,
+      height: 58,
+      borderRadius: 20,
+      backgroundColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 14,
+    },
+
+    proofTitle: {
+      color: theme.text,
+      fontSize: FONT_TITLE,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 23,
+    },
+
+    proofSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_LABEL,
+      lineHeight: 19,
+      textAlign: "center",
+      marginTop: 7,
+      fontWeight: "600",
+    },
+
+    proofTargetBox: {
+      width: "100%",
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: 18,
+      padding: 14,
+      marginTop: 16,
+      marginBottom: 15,
+    },
+
+    proofTargetLabel: {
+      color: theme.primaryLight,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      marginBottom: 5,
+      lineHeight: 16,
+    },
+
+    proofTargetText: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      lineHeight: 19,
+    },
+
+    proofUploadBox: {
+      width: "100%",
+      height: 150,
+      borderRadius: 20,
+      backgroundColor: theme.dashedBg,
+      borderWidth: 1,
+      borderColor: theme.dashedBorder,
+      borderStyle: "dashed",
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 12,
+    },
+
+    proofUploadText: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      marginTop: 8,
+      lineHeight: 19,
+    },
+
+    proofUploadSubtext: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      fontWeight: "700",
+      marginTop: 4,
+      lineHeight: 16,
+    },
+
+    proofPreviewImage: {
+      width: "100%",
+      height: 180,
+      borderRadius: 20,
+      marginBottom: 12,
+    },
+
+    changeProofButton: {
+      height: 40,
+      borderRadius: 14,
+      paddingHorizontal: 14,
+      backgroundColor: theme.primaryTint,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 4,
+    },
+
+    changeProofText: {
+      color: theme.primaryLight,
+      fontSize: FONT_LABEL,
+      fontWeight: "900",
+      marginLeft: 7,
+      lineHeight: 18,
+    },
+
+    proofActions: {
+      flexDirection: "row",
+      width: "100%",
+      marginTop: 14,
+    },
+
+    proofCancelButton: {
+      flex: 1,
+      height: 52,
+      borderRadius: 17,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 9,
+    },
+
+    proofCancelText: {
+      color: theme.softText,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+    },
+
+    proofSubmitButton: {
+      flex: 1,
+      height: 52,
+      borderRadius: 17,
+      backgroundColor: theme.primary,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      marginLeft: 9,
+    },
+
+    proofSubmitText: {
+      color: theme.onPrimary,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      marginLeft: 7,
+      lineHeight: 19,
+    },
+
+    pickerOverlay: {
+      flex: 1,
+      backgroundColor: theme.overlay,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 20,
+    },
+
+    datePickerCard: {
+      width: "100%",
+      backgroundColor: theme.background,
+      borderRadius: 28,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 18,
+    },
+
+    pickerHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 18,
+    },
+
+    pickerHeaderCenter: {
+      alignItems: "center",
+      flex: 1,
+      paddingHorizontal: 10,
+    },
+
+    monthNavButton: {
+      width: 42,
+      height: 42,
+      borderRadius: 15,
+      backgroundColor: theme.surface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    pickerTitle: {
+      color: theme.text,
+      fontSize: FONT_HEADER,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 28,
+    },
+
+    pickerSubtitle: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      marginTop: 4,
+      textAlign: "center",
+      lineHeight: 16,
+    },
+
+    weekRow: {
+      flexDirection: "row",
+      marginBottom: 10,
+    },
+
+    weekText: {
+      flex: 1,
+      color: theme.primaryLight,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 16,
+    },
+
+    dateGrid: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+    },
+
+    dateOption: {
+      width: `${100 / 7}%`,
+      height: 44,
+      alignItems: "center",
+      justifyContent: "center",
+      borderRadius: 14,
+      marginBottom: 6,
+    },
+
+    selectedDateOption: {
+      backgroundColor: theme.primary,
+    },
+
+    dateOptionText: {
+      color: theme.text,
+      fontSize: FONT_BODY,
+      fontWeight: "800",
+      textAlign: "center",
+      lineHeight: 19,
+    },
+
+    selectedDateOptionText: {
+      color: theme.onPrimary,
+      fontWeight: "900",
+    },
+
+    pickerCancelButton: {
+      height: 50,
+      borderRadius: 16,
+      backgroundColor: theme.surface,
+      alignItems: "center",
+      justifyContent: "center",
+      marginTop: 14,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+
+    pickerCancelText: {
+      color: theme.softText,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+    },
+
+    timePickerOverlay: {
+      flex: 1,
+      backgroundColor: theme.overlay,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 18,
+    },
+
+    timePickerCard: {
+      width: "100%",
+      backgroundColor: theme.background,
+      borderRadius: 26,
+      borderWidth: 1,
+      borderColor: theme.border,
+      paddingHorizontal: 16,
+      paddingTop: 14,
+      paddingBottom: 16,
+    },
+
+    timePickerMainTitle: {
+      color: theme.text,
+      fontSize: FONT_WHEEL,
+      fontWeight: "900",
+      textAlign: "center",
+      marginBottom: 8,
+      lineHeight: 21,
+    },
+
+    timeWheelFrame: {
+      height: 190,
+      justifyContent: "center",
+      marginBottom: 14,
+    },
+
+    timeWheelHighlight: {
+      position: "absolute",
+      left: 36,
+      right: 36,
+      top: 76,
+      height: 38,
+      borderRadius: 13,
+      backgroundColor: theme.primaryTintStrong,
+      borderWidth: 1,
+      borderColor: theme.dashedBorder,
+    },
+
+    timeWheelColumns: {
+      height: TIME_ITEM_HEIGHT * 5,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    timeWheelColumn: {
+      width: 58,
+      height: TIME_ITEM_HEIGHT * 5,
+    },
+
+    timePeriodColumn: {
+      width: 62,
+      height: TIME_ITEM_HEIGHT * 5,
+    },
+
+    timeWheelScrollContent: {
+      paddingVertical: TIME_WHEEL_PADDING,
+    },
+
+    timeColonColumn: {
+      width: 22,
+      height: TIME_ITEM_HEIGHT,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    timeWheelRow: {
+      height: TIME_ITEM_HEIGHT,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    timeWheelText: {
+      color: theme.placeholder,
+      fontSize: FONT_WHEEL,
+      fontWeight: "700",
+      textAlign: "center",
+      lineHeight: 21,
+    },
+
+    timeWheelActiveText: {
+      color: theme.text,
+      fontSize: FONT_HEADER,
+      fontWeight: "900",
+      lineHeight: 28,
+    },
+
+    timeColonActiveText: {
+      color: theme.text,
+      fontSize: FONT_HEADER,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 28,
+    },
+
+    timePeriodText: {
+      color: theme.placeholder,
+      fontSize: FONT_MEDIUM,
+      fontWeight: "800",
+      textTransform: "lowercase",
+      textAlign: "center",
+      lineHeight: 20,
+    },
+
+    timePeriodActiveText: {
+      color: theme.text,
+      fontSize: FONT_WHEEL_ACTIVE,
+      fontWeight: "900",
+      lineHeight: 23,
+    },
+
+    presetsLabel: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      marginBottom: 9,
+      lineHeight: 16,
+    },
+
+    presetsRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginBottom: 13,
+    },
+
+    presetButton: {
+      flex: 1,
+      height: 38,
+      borderRadius: 12,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    presetButtonSpacing: {
+      marginRight: 8,
+    },
+
+    activePresetButton: {
+      borderColor: theme.primaryLight,
+      backgroundColor: theme.primaryTintStrong,
+    },
+
+    presetButtonText: {
+      color: theme.muted,
+      fontSize: FONT_SMALL,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 16,
+    },
+
+    activePresetButtonText: {
+      color: theme.primaryLight,
+    },
+
+    timeDoneButton: {
+      height: 48,
+      borderRadius: 15,
+      backgroundColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    timeDoneText: {
+      color: theme.onPrimary,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      textAlign: "center",
+      lineHeight: 19,
+    },
+
+    customReminderOverlay: {
+      flex: 1,
+      backgroundColor: theme.overlay,
+      alignItems: "center",
+      justifyContent: "center",
+      paddingHorizontal: 20,
+    },
+
+    customReminderCard: {
+      width: "100%",
+      backgroundColor: theme.background,
+      borderRadius: 26,
+      paddingTop: 20,
+      paddingHorizontal: 20,
+      paddingBottom: 18,
+      borderWidth: 1,
+      borderColor: theme.border,
+      shadowColor: theme.primary,
+      shadowOpacity: 0.18,
+      shadowRadius: 14,
+      shadowOffset: { width: 0, height: 6 },
+      elevation: 8,
+    },
+
+    customReminderTitle: {
+      color: theme.text,
+      fontSize: FONT_TITLE,
+      fontWeight: "900",
+      marginBottom: 26,
+      lineHeight: 23,
+    },
+
+    customReminderWheelFrame: {
+      height: 112,
+      justifyContent: "center",
+    },
+
+    customReminderHighlight: {
+      position: "absolute",
+      left: 14,
+      right: 14,
+      top: 36,
+      height: 40,
+      borderRadius: 14,
+      backgroundColor: theme.primaryTintStrong,
+      borderWidth: 1,
+      borderColor: theme.primaryBorder,
+    },
+
+    customReminderColumns: {
+      height: REMINDER_ITEM_HEIGHT * 3,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    customReminderNumberColumn: {
+      width: 60,
+      height: REMINDER_ITEM_HEIGHT * 3,
+    },
+
+    customReminderUnitColumn: {
+      width: 120,
+      height: REMINDER_ITEM_HEIGHT * 3,
+    },
+
+    customReminderTimingColumn: {
+      width: 95,
+      height: REMINDER_ITEM_HEIGHT * 3,
+    },
+
+    customReminderWheelContent: {
+      paddingVertical: REMINDER_WHEEL_PADDING,
+    },
+
+    customReminderWheelRow: {
+      height: REMINDER_ITEM_HEIGHT,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+
+    customReminderWheelText: {
+      color: theme.placeholder,
+      fontSize: FONT_WHEEL,
+      fontWeight: "700",
+      textAlign: "center",
+      lineHeight: 21,
+    },
+
+    customReminderWheelActiveText: {
+      color: theme.text,
+      fontSize: FONT_WHEEL_ACTIVE,
+      fontWeight: "900",
+      lineHeight: 23,
+    },
+
+    customReminderPreviewPill: {
+      height: 42,
+      borderRadius: 21,
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: "center",
+      justifyContent: "center",
+      marginHorizontal: 14,
+      marginTop: 18,
+      paddingHorizontal: 12,
+    },
+
+    customReminderPreviewText: {
+      color: theme.softText,
+      fontSize: FONT_LABEL,
+      fontWeight: "800",
+      textAlign: "center",
+      lineHeight: 18,
+    },
+
+    customReminderActions: {
+      flexDirection: "row",
+      justifyContent: "flex-end",
+      alignItems: "center",
+      marginTop: 22,
+    },
+
+    customReminderCancelText: {
+      color: theme.muted,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      marginRight: 30,
+      lineHeight: 19,
+    },
+
+    customReminderSaveText: {
+      color: theme.primaryLight,
+      fontSize: FONT_BODY,
+      fontWeight: "900",
+      lineHeight: 19,
+    },
+  });

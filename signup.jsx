@@ -1,8 +1,12 @@
-import { Feather, FontAwesome, Ionicons } from "@expo/vector-icons";
+import { Feather, Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ActivityIndicator,
+  Alert,
+  DeviceEventEmitter,
   Image,
   KeyboardAvoidingView,
   Platform,
@@ -15,9 +19,57 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { supabase } from "../lib/supabase";
 
 const TOP_SAFE_SPACE =
   Platform.OS === "android" ? StatusBar.currentHeight || 24 : 12;
+
+const THEME_STORAGE_KEY = "schedwise_app_theme_mode";
+const THEME_CHANGE_EVENT = "schedwise_theme_changed";
+
+const DARK_THEME = {
+  mode: "dark",
+  background: "#081225",
+  statusBarStyle: "light-content",
+  headerGradient: ["#081225", "#0d2342", "#081225"],
+  buttonGradient: ["#4f7df3", "#5f8fff", "#78b7ff"],
+  text: "#ffffff",
+  mutedText: "#8ea2c1",
+  softText: "#91a5c6",
+  placeholder: "#7384a3",
+  inputIcon: "#8fa3c7",
+  primary: "#65a1ff",
+  card: "#0d1529",
+  input: "#121c32",
+  border: "#1b2944",
+  inputBorder: "#21304c",
+  backButton: "rgba(255,255,255,0.08)",
+  backButtonBorder: "rgba(255,255,255,0.08)",
+  backIcon: "#d7e4ff",
+  shadow: "#000",
+};
+
+const LIGHT_THEME = {
+  mode: "light",
+  background: "#f4f7fb",
+  statusBarStyle: "dark-content",
+  headerGradient: ["#eaf2ff", "#f7fbff", "#f4f7fb"],
+  buttonGradient: ["#4f7df3", "#5f8fff", "#78b7ff"],
+  text: "#10203b",
+  mutedText: "#60718f",
+  softText: "#4f607a",
+  placeholder: "#8a98ad",
+  inputIcon: "#60718f",
+  primary: "#3f76e8",
+  card: "#ffffff",
+  input: "#eef4ff",
+  border: "#d9e4f2",
+  inputBorder: "#ccd8ea",
+  backButton: "rgba(79,125,243,0.10)",
+  backButtonBorder: "rgba(79,125,243,0.18)",
+  backIcon: "#3f76e8",
+  shadow: "#9ab8ff",
+};
 
 export default function SignupScreen() {
   const router = useRouter();
@@ -25,11 +77,133 @@ export default function SignupScreen() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [themeMode, setThemeMode] = useState(null);
+
+  const theme = themeMode === "light" ? LIGHT_THEME : DARK_THEME;
+  const styles = useMemo(() => createStyles(theme), [theme]);
+
+  const loadThemeMode = useCallback(async () => {
+    try {
+      const savedTheme = await AsyncStorage.getItem(THEME_STORAGE_KEY);
+      setThemeMode(savedTheme === "light" ? "light" : "dark");
+    } catch {
+      setThemeMode("dark");
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadThemeMode();
+      setFullName("");
+      setEmail("");
+      setPassword("");
+      setConfirmPassword("");
+      setShowPassword(false);
+      setShowConfirmPassword(false);
+    }, [loadThemeMode])
+  );
+
+  useEffect(() => {
+    loadThemeMode();
+  }, [loadThemeMode]);
+
+  useEffect(() => {
+    const subscription = DeviceEventEmitter.addListener(
+      THEME_CHANGE_EVENT,
+      (nextTheme) => {
+        setThemeMode(nextTheme === "light" ? "light" : "dark");
+      }
+    );
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+
+  const clearInputs = () => {
+    setFullName("");
+    setEmail("");
+    setPassword("");
+    setConfirmPassword("");
+    setShowPassword(false);
+    setShowConfirmPassword(false);
+  };
+
+  const handleCreateAccount = async () => {
+    const cleanedName = fullName.trim();
+    const cleanedEmail = email.trim().toLowerCase();
+
+    if (!cleanedName || !cleanedEmail || !password || !confirmPassword) {
+      Alert.alert("Missing Information", "Please complete all fields.");
+      return;
+    }
+
+    if (password.length < 6) {
+      Alert.alert(
+        "Weak Password",
+        "Password must be at least 6 characters long."
+      );
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      Alert.alert("Password Mismatch", "Your passwords do not match.");
+      return;
+    }
+
+    setLoading(true);
+
+    const {
+      data: { session },
+      error,
+    } = await supabase.auth.signUp({
+      email: cleanedEmail,
+      password,
+      options: {
+        data: {
+          full_name: cleanedName,
+        },
+      },
+    });
+
+    setLoading(false);
+
+    if (error) {
+      Alert.alert("Sign Up Failed", error.message);
+      return;
+    }
+
+    clearInputs();
+
+    if (!session) {
+      Alert.alert(
+        "Check Your Email",
+        "Your account was created, but Supabase email confirmation is enabled. Please verify your email first before signing in."
+      );
+
+      router.replace("/signin");
+      return;
+    }
+
+    Alert.alert("Account Created", "Welcome to SchedWise!");
+    router.replace("/");
+  };
+
+  if (themeMode === null) {
+    return null;
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar
-        barStyle="light-content"
-        backgroundColor="#081225"
+        barStyle={theme.statusBarStyle}
+        backgroundColor={theme.background}
         translucent={false}
       />
 
@@ -40,17 +214,19 @@ export default function SignupScreen() {
         <ScrollView
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
         >
-          <LinearGradient
-            colors={["#081225", "#0d2342", "#081225"]}
-            style={styles.header}
-          >
+          <LinearGradient colors={theme.headerGradient} style={styles.header}>
             <TouchableOpacity
               style={styles.backButton}
               activeOpacity={0.75}
-              onPress={() => router.replace("/signin")}
+              onPress={() => {
+                clearInputs();
+                router.replace("/signin");
+              }}
+              disabled={loading}
             >
-              <Ionicons name="arrow-back" size={22} color="#d7e4ff" />
+              <Ionicons name="arrow-back" size={22} color={theme.backIcon} />
             </TouchableOpacity>
 
             <View style={styles.logoWrapper}>
@@ -73,13 +249,20 @@ export default function SignupScreen() {
               <Feather
                 name="user"
                 size={18}
-                color="#8fa3c7"
+                color={theme.inputIcon}
                 style={styles.inputIcon}
               />
+
               <TextInput
                 placeholder="Enter your full name"
-                placeholderTextColor="#7384a3"
+                placeholderTextColor={theme.placeholder}
                 style={styles.input}
+                value={fullName}
+                onChangeText={setFullName}
+                autoCorrect={false}
+                autoComplete="off"
+                importantForAutofill="no"
+                textContentType="none"
               />
             </View>
 
@@ -90,15 +273,22 @@ export default function SignupScreen() {
               <Feather
                 name="mail"
                 size={18}
-                color="#8fa3c7"
+                color={theme.inputIcon}
                 style={styles.inputIcon}
               />
+
               <TextInput
                 placeholder="you@university.edu"
-                placeholderTextColor="#7384a3"
+                placeholderTextColor={theme.placeholder}
                 style={styles.input}
                 keyboardType="email-address"
                 autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="off"
+                importantForAutofill="no"
+                textContentType="none"
+                value={email}
+                onChangeText={setEmail}
               />
             </View>
 
@@ -107,14 +297,22 @@ export default function SignupScreen() {
               <Feather
                 name="lock"
                 size={18}
-                color="#8fa3c7"
+                color={theme.inputIcon}
                 style={styles.inputIcon}
               />
+
               <TextInput
                 placeholder="Create a password"
-                placeholderTextColor="#7384a3"
+                placeholderTextColor={theme.placeholder}
                 style={styles.input}
                 secureTextEntry={!showPassword}
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="off"
+                importantForAutofill="no"
+                textContentType="none"
+                value={password}
+                onChangeText={setPassword}
               />
 
               <TouchableOpacity
@@ -124,7 +322,7 @@ export default function SignupScreen() {
                 <Feather
                   name={showPassword ? "eye-off" : "eye"}
                   size={18}
-                  color="#8fa3c7"
+                  color={theme.inputIcon}
                 />
               </TouchableOpacity>
             </View>
@@ -136,14 +334,22 @@ export default function SignupScreen() {
               <Feather
                 name="shield"
                 size={18}
-                color="#8fa3c7"
+                color={theme.inputIcon}
                 style={styles.inputIcon}
               />
+
               <TextInput
                 placeholder="Confirm your password"
-                placeholderTextColor="#7384a3"
+                placeholderTextColor={theme.placeholder}
                 style={styles.input}
                 secureTextEntry={!showConfirmPassword}
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="off"
+                importantForAutofill="no"
+                textContentType="none"
+                value={confirmPassword}
+                onChangeText={setConfirmPassword}
               />
 
               <TouchableOpacity
@@ -153,52 +359,53 @@ export default function SignupScreen() {
                 <Feather
                   name={showConfirmPassword ? "eye-off" : "eye"}
                   size={18}
-                  color="#8fa3c7"
+                  color={theme.inputIcon}
                 />
               </TouchableOpacity>
             </View>
 
             <TouchableOpacity
               activeOpacity={0.85}
-              onPress={() =>
-                router.replace({
-                  pathname: "/",
-                  params: { auth: "true" },
-                })
-              }
+              onPress={handleCreateAccount}
+              disabled={loading}
             >
               <LinearGradient
-                colors={["#4f7df3", "#5f8fff", "#78b7ff"]}
+                colors={theme.buttonGradient}
                 start={{ x: 0, y: 0 }}
                 end={{ x: 1, y: 0 }}
-                style={styles.createButton}
+                style={[styles.createButton, loading && styles.disabledButton]}
               >
-                <Text style={styles.createButtonText}>Create Account</Text>
-                <Feather
-                  name="arrow-right"
-                  size={19}
-                  color="#ffffff"
-                  style={styles.createIcon}
-                />
+                <Text style={styles.createButtonText}>
+                  {loading ? "Creating..." : "Create Account"}
+                </Text>
+
+                {loading ? (
+                  <ActivityIndicator
+                    size="small"
+                    color="#ffffff"
+                    style={styles.createIcon}
+                  />
+                ) : (
+                  <Feather
+                    name="arrow-right"
+                    size={19}
+                    color="#ffffff"
+                    style={styles.createIcon}
+                  />
+                )}
               </LinearGradient>
-            </TouchableOpacity>
-
-            <View style={styles.dividerRow}>
-              <View style={styles.divider} />
-              <Text style={styles.dividerText}>or sign up with</Text>
-              <View style={styles.divider} />
-            </View>
-
-            <TouchableOpacity style={styles.googleButton} activeOpacity={0.8}>
-              <FontAwesome name="google" size={20} color="#ff4d5f" />
-              <Text style={styles.googleText}>Continue with Google</Text>
             </TouchableOpacity>
 
             <View style={styles.signinRow}>
               <Text style={styles.signinText}>Already have an account? </Text>
+
               <TouchableOpacity
                 activeOpacity={0.7}
-                onPress={() => router.replace("/signin")}
+                onPress={() => {
+                  clearInputs();
+                  router.replace("/signin");
+                }}
+                disabled={loading}
               >
                 <Text style={styles.signinLink}>Sign in</Text>
               </TouchableOpacity>
@@ -216,204 +423,173 @@ export default function SignupScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#081225",
-  },
+const createStyles = (theme) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.background,
+    },
 
-  keyboardView: {
-    flex: 1,
-  },
+    keyboardView: {
+      flex: 1,
+    },
 
-  scrollContent: {
-    flexGrow: 1,
-    paddingBottom: 28,
-  },
+    scrollContent: {
+      flexGrow: 1,
+      paddingBottom: 28,
+    },
 
-  header: {
-    minHeight: 300,
-    paddingHorizontal: 18,
-    paddingTop: TOP_SAFE_SPACE,
-    borderBottomLeftRadius: 28,
-    borderBottomRightRadius: 28,
-  },
+    header: {
+      minHeight: 300,
+      paddingHorizontal: 18,
+      paddingTop: TOP_SAFE_SPACE,
+      borderBottomLeftRadius: 28,
+      borderBottomRightRadius: 28,
+    },
 
-  backButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 14,
-    backgroundColor: "rgba(255,255,255,0.08)",
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.08)",
-  },
+    backButton: {
+      width: 40,
+      height: 40,
+      borderRadius: 14,
+      backgroundColor: theme.backButton,
+      alignItems: "center",
+      justifyContent: "center",
+      borderWidth: 1,
+      borderColor: theme.backButtonBorder,
+    },
 
-  logoWrapper: {
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: -18,
-  },
+    logoWrapper: {
+      alignItems: "center",
+      justifyContent: "center",
+      marginTop: -18,
+    },
 
-  logoImage: {
-    width: 270,
-    height: 270,
-  },
+    logoImage: {
+      width: 270,
+      height: 270,
+    },
 
-  card: {
-    marginHorizontal: 18,
-    marginTop: -28,
-    backgroundColor: "#0d1529",
-    borderRadius: 22,
-    paddingHorizontal: 20,
-    paddingTop: 23,
-    paddingBottom: 23,
-    borderWidth: 1,
-    borderColor: "#1b2944",
-    shadowColor: "#000",
-    shadowOpacity: 0.25,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 7,
-  },
+    card: {
+      marginHorizontal: 18,
+      marginTop: -28,
+      backgroundColor: theme.card,
+      borderRadius: 22,
+      paddingHorizontal: 20,
+      paddingTop: 23,
+      paddingBottom: 23,
+      borderWidth: 1,
+      borderColor: theme.border,
+      shadowColor: theme.shadow,
+      shadowOpacity: theme.mode === "dark" ? 0.25 : 0.14,
+      shadowRadius: 14,
+      shadowOffset: { width: 0, height: 8 },
+      elevation: 7,
+    },
 
-  title: {
-    color: "#ffffff",
-    fontSize: 25,
-    fontWeight: "900",
-  },
+    title: {
+      color: theme.text,
+      fontSize: 25,
+      fontWeight: "900",
+    },
 
-  subtitle: {
-    color: "#91a5c6",
-    fontSize: 15,
-    marginTop: 7,
-    marginBottom: 25,
-    lineHeight: 21,
-  },
+    subtitle: {
+      color: theme.softText,
+      fontSize: 15,
+      marginTop: 7,
+      marginBottom: 25,
+      lineHeight: 21,
+    },
 
-  label: {
-    color: "#8ea2c1",
-    fontSize: 12,
-    fontWeight: "800",
-    letterSpacing: 1.1,
-    marginBottom: 9,
-  },
+    label: {
+      color: theme.mutedText,
+      fontSize: 12,
+      fontWeight: "800",
+      letterSpacing: 1.1,
+      marginBottom: 9,
+    },
 
-  fieldSpacing: {
-    marginTop: 16,
-  },
+    fieldSpacing: {
+      marginTop: 16,
+    },
 
-  inputBox: {
-    height: 52,
-    borderRadius: 15,
-    backgroundColor: "#121c32",
-    borderWidth: 1,
-    borderColor: "#21304c",
-    paddingHorizontal: 15,
-    flexDirection: "row",
-    alignItems: "center",
-  },
+    inputBox: {
+      height: 52,
+      borderRadius: 15,
+      backgroundColor: theme.input,
+      borderWidth: 1,
+      borderColor: theme.inputBorder,
+      paddingHorizontal: 15,
+      flexDirection: "row",
+      alignItems: "center",
+    },
 
-  inputIcon: {
-    marginRight: 11,
-  },
+    inputIcon: {
+      marginRight: 11,
+    },
 
-  input: {
-    flex: 1,
-    color: "#ffffff",
-    fontSize: 15,
-  },
+    input: {
+      flex: 1,
+      color: theme.text,
+      fontSize: 15,
+    },
 
-  createButton: {
-    height: 54,
-    borderRadius: 15,
-    marginTop: 24,
-    alignItems: "center",
-    justifyContent: "center",
-    flexDirection: "row",
-    shadowColor: "#5f8fff",
-    shadowOpacity: 0.35,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 7 },
-    elevation: 5,
-  },
+    createButton: {
+      height: 54,
+      borderRadius: 15,
+      marginTop: 24,
+      alignItems: "center",
+      justifyContent: "center",
+      flexDirection: "row",
+      shadowColor: "#5f8fff",
+      shadowOpacity: 0.35,
+      shadowRadius: 12,
+      shadowOffset: { width: 0, height: 7 },
+      elevation: 5,
+    },
 
-  createButtonText: {
-    color: "#ffffff",
-    fontSize: 16,
-    fontWeight: "900",
-  },
+    disabledButton: {
+      opacity: 0.7,
+    },
 
-  createIcon: {
-    marginLeft: 8,
-  },
+    createButtonText: {
+      color: "#ffffff",
+      fontSize: 16,
+      fontWeight: "900",
+    },
 
-  dividerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginVertical: 24,
-  },
+    createIcon: {
+      marginLeft: 8,
+    },
 
-  divider: {
-    flex: 1,
-    height: 1,
-    backgroundColor: "#263552",
-  },
+    signinRow: {
+      marginTop: 22,
+      flexDirection: "row",
+      justifyContent: "center",
+      alignItems: "center",
+    },
 
-  dividerText: {
-    color: "#8ea2c1",
-    fontSize: 13,
-    marginHorizontal: 12,
-  },
+    signinText: {
+      color: theme.softText,
+      fontSize: 13,
+    },
 
-  googleButton: {
-    height: 51,
-    borderRadius: 15,
-    backgroundColor: "#121c32",
-    borderWidth: 1,
-    borderColor: "#233350",
-    alignItems: "center",
-    justifyContent: "center",
-    flexDirection: "row",
-  },
+    signinLink: {
+      color: theme.primary,
+      fontSize: 13,
+      fontWeight: "900",
+    },
 
-  googleText: {
-    color: "#ffffff",
-    fontSize: 15,
-    fontWeight: "800",
-    marginLeft: 12,
-  },
+    termsText: {
+      marginTop: 21,
+      marginHorizontal: 28,
+      textAlign: "center",
+      color: theme.mutedText,
+      fontSize: 11.5,
+      lineHeight: 18,
+    },
 
-  signinRow: {
-    marginTop: 22,
-    flexDirection: "row",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-
-  signinText: {
-    color: "#91a5c6",
-    fontSize: 13,
-  },
-
-  signinLink: {
-    color: "#65a1ff",
-    fontSize: 13,
-    fontWeight: "900",
-  },
-
-  termsText: {
-    marginTop: 21,
-    marginHorizontal: 28,
-    textAlign: "center",
-    color: "#8ea2c1",
-    fontSize: 11.5,
-    lineHeight: 18,
-  },
-
-  termsLink: {
-    color: "#65a1ff",
-    fontWeight: "700",
-  },
-});
+    termsLink: {
+      color: theme.primary,
+      fontWeight: "700",
+    },
+  });
