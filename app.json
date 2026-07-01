@@ -4,7 +4,7 @@
     "slug": "SchedWise",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
+    "icon": "./assets/images/SchedWise.png",
     "scheme": "schedwise",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -19,7 +19,8 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.loxanz.schedwise"
     },
     "web": {
       "output": "static",
@@ -38,11 +39,23 @@
             "backgroundColor": "#000000"
           }
         }
+      ],
+      [
+        "expo-web-browser",
+        {
+          "experimentalLauncherActivity": false
+        }
       ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5fd9966b-d008-4dad-81cf-9ab346dbd1eb"
+      }
     }
   }
 }
