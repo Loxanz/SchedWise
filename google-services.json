@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "103938358412",
+    "project_id": "schedwise-7a68d",
+    "storage_bucket": "schedwise-7a68d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:103938358412:android:f6b1bc1f1cf25890d6cfa9",
+        "android_client_info": {
+          "package_name": "com.loxanz.schedwise"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBR0trAabcSkS_JsfB4Fg5gcD7q3Ntn7i0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
