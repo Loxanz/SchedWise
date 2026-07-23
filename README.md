@@ -40,7 +40,6 @@ This project is developed as a **Capstone Project** for the Bachelor of Science 
   * Upcoming deadlines
   * Pending tasks
   * Schedule conflicts
-  * Important academic events
 
 ### 💬 AI Chatbot Assistant
 
